@@ -178,3 +178,7 @@ ALTER TABLE addresses ADD COLUMN IF NOT EXISTS state text;
 ALTER TABLE addresses ADD COLUMN IF NOT EXISTS postal_code text;
 ALTER TABLE addresses ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
 CREATE INDEX IF NOT EXISTS idx_addresses_user ON addresses(user_id);
+
+-- serviços: exclusão lógica (pedidos antigos continuam referenciando o serviço)
+ALTER TABLE services ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
+CREATE INDEX IF NOT EXISTS idx_services_provider ON services(provider_id);

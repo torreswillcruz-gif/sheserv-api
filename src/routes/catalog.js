@@ -16,7 +16,7 @@ const SELECT = `
     COALESCE(r.avg,0)::float AS rating, COALESCE(r.cnt,0)::int AS "reviewCount",
     COALESCE((SELECT json_agg(json_build_object('id',s.id,'categoryId',s.category_id,'title',s.title,
       'basePrice',s.base_price::float,'durationMinutes',s.duration_minutes))
-      FROM services s WHERE s.provider_id=u.id AND ($1::text IS NULL OR s.category_id=$1)), '[]') AS services
+      FROM services s WHERE s.provider_id=u.id AND s.active AND ($1::text IS NULL OR s.category_id=$1)), '[]') AS services
   FROM provider_profiles p
   JOIN users u ON u.id=p.user_id
   LEFT JOIN (SELECT target_id, avg(rating) avg, count(*) cnt FROM reviews WHERE direction='customer_to_provider' GROUP BY target_id) r
@@ -34,8 +34,8 @@ router.get("/providers", wrap(async (req, res) => {
     `${SELECT}
      WHERE p.activation_status='active'
        AND ($2::text IS NULL OR u.name ILIKE '%'||$2||'%' OR EXISTS
-            (SELECT 1 FROM services s WHERE s.provider_id=u.id AND s.title ILIKE '%'||$2||'%'))
-       AND ($1::text IS NULL OR EXISTS (SELECT 1 FROM services s WHERE s.provider_id=u.id AND s.category_id=$1))
+            (SELECT 1 FROM services s WHERE s.provider_id=u.id AND s.active AND s.title ILIKE '%'||$2||'%'))
+       AND ($1::text IS NULL OR EXISTS (SELECT 1 FROM services s WHERE s.provider_id=u.id AND s.active AND s.category_id=$1))
        AND ($3::timestamptz IS NULL OR NOT EXISTS (SELECT 1 FROM orders o WHERE o.provider_id=u.id
             AND o.status IN ('requested','accepted','on_the_way','in_progress')
             AND $3 < o.scheduled_at + o.duration_minutes * interval '1 minute'

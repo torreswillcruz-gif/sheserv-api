@@ -42,7 +42,7 @@ router.post("/orders", requireRole("cliente"), wrap(async (req, res) => {
 
   const order = await tx(async (c) => {
     const s = (await c.query(
-      `SELECT s.*, p.activation_status FROM services s JOIN provider_profiles p ON p.user_id=s.provider_id WHERE s.id=$1`,
+      `SELECT s.*, p.activation_status FROM services s JOIN provider_profiles p ON p.user_id=s.provider_id WHERE s.id=$1 AND s.active`,
       [b.serviceId])).rows[0];
     if (!s || s.activation_status !== "active") throw new ApiError(404, "not_found", "Service not available.");
 
