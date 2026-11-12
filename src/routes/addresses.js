@@ -1,84 +1,119 @@
-const router = require("express").Router();
+const addressesRouter = require("express").Router();
 const { z } = require("zod");
-const { query } = require("../db");
-const { ApiError, wrap } = require("../errors");
+const { runQuery } = require("../db");
+const { ApiError, asyncHandler } = require("../errors");
+const { isValidUuid } = require("../validation");
 
-const MAX_ADDRESSES = 20;
-const COLS = `id, label, street, number, complement, neighborhood, city, state,
+const MAX_ADDRESSES_PER_USER = 20;
+
+const ADDRESS_COLUMNS = `id, label, street, number, complement, neighborhood, city, state,
   postal_code AS "postalCode", latitude, longitude`;
 
-const createSchema = z.object({
+const baseAddressSchema = z.object({
   label: z.string().trim().max(50).optional(),
   street: z.string().trim().min(2).max(200),
   number: z.string().trim().max(20).optional(),
   complement: z.string().trim().max(100).optional(),
   neighborhood: z.string().trim().max(100).optional(),
   city: z.string().trim().min(2).max(100),
-  state: z.string().trim().length(2).transform((s) => s.toUpperCase()).optional(),
+  state: z.string().trim().length(2).transform((stateCode) => stateCode.toUpperCase()).optional(),
   postalCode: z.string().regex(/^\d{5}-?\d{3}$/, "Use o formato 00000-000")
-    .transform((s) => s.replace("-", "")).optional(),
+    .transform((postalCode) => postalCode.replace("-", "")).optional(),
   latitude: z.number().min(-90).max(90).optional(),
   longitude: z.number().min(-180).max(180).optional(),
 }).strict();
 
+// latitude e longitude só fazem sentido juntas
+const latitudeAndLongitudeTogether = [
+  (addressData) => (addressData.latitude === undefined) === (addressData.longitude === undefined),
+  { message: "Send latitude and longitude together.", path: ["longitude"] },
+];
+const createAddressSchema = baseAddressSchema.refine(...latitudeAndLongitudeTogether);
+const updateAddressSchema = baseAddressSchema.partial().refine(...latitudeAndLongitudeTogether);
+
+// campo enviado pelo app -> coluna do banco
 const FIELD_TO_COLUMN = {
-  label: "label", street: "street", number: "number", complement: "complement",
-  neighborhood: "neighborhood", city: "city", state: "state",
-  postalCode: "postal_code", latitude: "latitude", longitude: "longitude",
+  label: "label",
+  street: "street",
+  number: "number",
+  complement: "complement",
+  neighborhood: "neighborhood",
+  city: "city",
+  state: "state",
+  postalCode: "postal_code",
+  latitude: "latitude",
+  longitude: "longitude",
 };
 
-const validId = (id) => /^[0-9a-f-]{36}$/i.test(id);
-
-router.get("/me/addresses", wrap(async (req, res) => {
-  const { rows } = await query(
-    `SELECT ${COLS} FROM addresses WHERE user_id=$1 AND deleted_at IS NULL ORDER BY label NULLS LAST, street`,
-    [req.user.id]);
-  res.json(rows);
+addressesRouter.get("/me/addresses", asyncHandler(async (request, response) => {
+  const { rows: addresses } = await runQuery(
+    `SELECT ${ADDRESS_COLUMNS} FROM addresses WHERE user_id=$1 AND deleted_at IS NULL ORDER BY label NULLS LAST, street`,
+    [request.user.id]
+  );
+  response.json(addresses);
 }));
 
-router.post("/me/addresses", wrap(async (req, res) => {
-  const b = createSchema.parse(req.body);
-  const count = (await query("SELECT count(*)::int AS n FROM addresses WHERE user_id=$1 AND deleted_at IS NULL", [req.user.id])).rows[0].n;
-  if (count >= MAX_ADDRESSES) throw new ApiError(409, "limit_reached", `Maximum of ${MAX_ADDRESSES} addresses.`);
+addressesRouter.post("/me/addresses", asyncHandler(async (request, response) => {
+  const addressData = createAddressSchema.parse(request.body);
 
-  const { rows } = await query(
+  const { rows: countRows } = await runQuery(
+    "SELECT count(*)::int AS total FROM addresses WHERE user_id=$1 AND deleted_at IS NULL",
+    [request.user.id]
+  );
+  if (countRows[0].total >= MAX_ADDRESSES_PER_USER)
+    throw new ApiError(409, "limit_reached", `Maximum of ${MAX_ADDRESSES_PER_USER} addresses.`);
+
+  const { rows: createdAddresses } = await runQuery(
     `INSERT INTO addresses (user_id,label,street,number,complement,neighborhood,city,state,postal_code,latitude,longitude)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING ${COLS}`,
-    [req.user.id, b.label ?? null, b.street, b.number ?? null, b.complement ?? null, b.neighborhood ?? null,
-     b.city, b.state ?? null, b.postalCode ?? null, b.latitude ?? null, b.longitude ?? null]);
-  res.status(201).json(rows[0]);
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING ${ADDRESS_COLUMNS}`,
+    [request.user.id, addressData.label ?? null, addressData.street, addressData.number ?? null,
+     addressData.complement ?? null, addressData.neighborhood ?? null, addressData.city,
+     addressData.state ?? null, addressData.postalCode ?? null, addressData.latitude ?? null,
+     addressData.longitude ?? null]
+  );
+  response.status(201).json(createdAddresses[0]);
 }));
 
-router.get("/me/addresses/:id", wrap(async (req, res) => {
-  if (!validId(req.params.id)) throw new ApiError(404, "not_found", "Address not found.");
-  const { rows } = await query(
-    `SELECT ${COLS} FROM addresses WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`, [req.params.id, req.user.id]);
-  if (!rows[0]) throw new ApiError(404, "not_found", "Address not found.");
-  res.json(rows[0]);
+addressesRouter.get("/me/addresses/:id", asyncHandler(async (request, response) => {
+  if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Address not found.");
+
+  const { rows: matchingAddresses } = await runQuery(
+    `SELECT ${ADDRESS_COLUMNS} FROM addresses WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+    [request.params.id, request.user.id]
+  );
+  if (!matchingAddresses[0]) throw new ApiError(404, "not_found", "Address not found.");
+  response.json(matchingAddresses[0]);
 }));
 
-router.patch("/me/addresses/:id", wrap(async (req, res) => {
-  if (!validId(req.params.id)) throw new ApiError(404, "not_found", "Address not found.");
-  const b = createSchema.partial().parse(req.body);
-  const entries = Object.entries(b);
-  if (entries.length === 0) throw new ApiError(422, "validation_error", "The request is invalid.", { body: "No fields to update." });
+addressesRouter.patch("/me/addresses/:id", asyncHandler(async (request, response) => {
+  if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Address not found.");
 
-  const sets = entries.map(([k], i) => `${FIELD_TO_COLUMN[k]}=$${i + 3}`);
-  const { rows } = await query(
-    `UPDATE addresses SET ${sets.join(", ")} WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL RETURNING ${COLS}`,
-    [req.params.id, req.user.id, ...entries.map(([, v]) => v)]);
-  if (!rows[0]) throw new ApiError(404, "not_found", "Address not found.");
-  res.json(rows[0]);
+  const addressChanges = updateAddressSchema.parse(request.body);
+  const changedFields = Object.entries(addressChanges);
+  if (changedFields.length === 0)
+    throw new ApiError(422, "validation_error", "The request is invalid.", { body: "No fields to update." });
+
+  // $1 = id do endereço, $2 = dono; os campos alterados começam no $3
+  const columnAssignments = changedFields.map(([fieldName], position) => `${FIELD_TO_COLUMN[fieldName]}=$${position + 3}`);
+  const { rows: updatedAddresses } = await runQuery(
+    `UPDATE addresses SET ${columnAssignments.join(", ")}
+     WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL RETURNING ${ADDRESS_COLUMNS}`,
+    [request.params.id, request.user.id, ...changedFields.map(([, fieldValue]) => fieldValue)]
+  );
+  if (!updatedAddresses[0]) throw new ApiError(404, "not_found", "Address not found.");
+  response.json(updatedAddresses[0]);
 }));
 
 // exclusão lógica: pedidos antigos continuam apontando para o endereço
-router.delete("/me/addresses/:id", wrap(async (req, res) => {
-  if (!validId(req.params.id)) throw new ApiError(404, "not_found", "Address not found.");
-  const { rowCount } = await query(
+addressesRouter.delete("/me/addresses/:id", asyncHandler(async (request, response) => {
+  if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Address not found.");
+
+  const { rowCount: removedCount } = await runQuery(
     "UPDATE addresses SET deleted_at=now() WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
-    [req.params.id, req.user.id]);
-  if (!rowCount) throw new ApiError(404, "not_found", "Address not found.");
-  res.sendStatus(204);
+    [request.params.id, request.user.id]
+  );
+  if (!removedCount) throw new ApiError(404, "not_found", "Address not found.");
+  response.sendStatus(204);
 }));
 
-module.exports = router;
+module.exports = addressesRouter;

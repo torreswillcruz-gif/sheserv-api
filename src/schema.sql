@@ -182,3 +182,33 @@ CREATE INDEX IF NOT EXISTS idx_addresses_user ON addresses(user_id);
 -- serviços: exclusão lógica (pedidos antigos continuam referenciando o serviço)
 ALTER TABLE services ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
 CREATE INDEX IF NOT EXISTS idx_services_provider ON services(provider_id);
+
+-- localização base da prestadora (usada só para calcular distância; nunca exposta no catálogo)
+ALTER TABLE provider_profiles ADD COLUMN IF NOT EXISTS latitude double precision;
+ALTER TABLE provider_profiles ADD COLUMN IF NOT EXISTS longitude double precision;
+
+-- onde o atendimento acontece: "at_customer" (prestadora vai até o cliente) ou "at_provider" (cliente vai até ela)
+ALTER TABLE services ADD COLUMN IF NOT EXISTS service_location text NOT NULL DEFAULT 'at_customer'
+  CHECK (service_location IN ('at_customer', 'at_provider'));
+
+-- cópia do tipo de atendimento no pedido (se o serviço mudar depois, o pedido antigo não muda)
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS service_location text NOT NULL DEFAULT 'at_customer'
+  CHECK (service_location IN ('at_customer', 'at_provider'));
+
+-- em atendimento na prestadora o cliente não precisa informar endereço
+ALTER TABLE orders ALTER COLUMN address_id DROP NOT NULL;
+
+-- local de atendimento da prestadora (um por prestadora)
+CREATE TABLE IF NOT EXISTS provider_venues (
+  provider_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  street text NOT NULL,
+  number text,
+  complement text,
+  neighborhood text NOT NULL,
+  city text NOT NULL,
+  state text,
+  postal_code text,
+  latitude double precision NOT NULL,
+  longitude double precision NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);

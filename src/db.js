@@ -2,30 +2,32 @@ const { Pool } = require("pg");
 const fs = require("fs");
 const path = require("path");
 
-const pool = new Pool({
+const connectionPool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined,
 });
 
-const query = (text, params) => pool.query(text, params);
+const runQuery = (sqlText, parameterValues) => connectionPool.query(sqlText, parameterValues);
 
-async function tx(fn) {
-  const client = await pool.connect();
+// Executa várias queries juntas: se alguma falhar, nenhuma é salva
+async function runInTransaction(transactionCallback) {
+  const transactionClient = await connectionPool.connect();
   try {
-    await client.query("BEGIN");
-    const result = await fn(client);
-    await client.query("COMMIT");
-    return result;
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
+    await transactionClient.query("BEGIN");
+    const callbackResult = await transactionCallback(transactionClient);
+    await transactionClient.query("COMMIT");
+    return callbackResult;
+  } catch (transactionError) {
+    await transactionClient.query("ROLLBACK");
+    throw transactionError;
   } finally {
-    client.release();
+    transactionClient.release();
   }
 }
 
-async function migrate() {
-  await pool.query(fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8"));
+async function runMigrations() {
+  const schemaSql = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
+  await connectionPool.query(schemaSql);
 }
 
-module.exports = { pool, query, tx, migrate };
+module.exports = { connectionPool, runQuery, runInTransaction, runMigrations };

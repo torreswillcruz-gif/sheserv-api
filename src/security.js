@@ -1,32 +1,46 @@
 const crypto = require("crypto");
-const jwt = require("jsonwebtoken");
-const { query } = require("./db");
+const jsonWebToken = require("jsonwebtoken");
+const { runQuery } = require("./db");
 const { ApiError } = require("./errors");
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const KEY = crypto.createHash("sha256").update(process.env.DATA_ENCRYPTION_KEY || "").digest();
-const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
+const JWT_ALGORITHM = "HS256";
+const JWT_ISSUER = "sheserv-api";
+const ACCESS_TOKEN_LIFETIME = "15m";
 
-function encrypt(plain) {
-  const iv = crypto.randomBytes(12);
-  const c = crypto.createCipheriv("aes-256-gcm", KEY, iv);
-  const enc = Buffer.concat([c.update(plain, "utf8"), c.final()]);
-  return Buffer.concat([iv, c.getAuthTag(), enc]).toString("base64");
-}
-function decrypt(b64) {
-  const buf = Buffer.from(b64, "base64");
-  const d = crypto.createDecipheriv("aes-256-gcm", KEY, buf.subarray(0, 12));
-  d.setAuthTag(buf.subarray(12, 28));
-  return Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString("utf8");
+const ENCRYPTION_KEY = crypto.createHash("sha256").update(process.env.DATA_ENCRYPTION_KEY || "").digest();
+
+const hashWithSha256 = (text) => crypto.createHash("sha256").update(text).digest("hex");
+
+// Criptografia AES-256-GCM: o resultado guarda vetor inicial + tag de autenticação + conteúdo
+function encryptText(plainText) {
+  const initializationVector = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", ENCRYPTION_KEY, initializationVector);
+  const encryptedContent = Buffer.concat([cipher.update(plainText, "utf8"), cipher.final()]);
+  return Buffer.concat([initializationVector, cipher.getAuthTag(), encryptedContent]).toString("base64");
 }
 
-async function issueSession(user) {
-  const accessToken = jwt.sign({ sub: user.id, roles: user.roles }, JWT_SECRET, { expiresIn: "15m", algorithm: "HS256", issuer: "sheserv-api" });
+function decryptText(encryptedBase64) {
+  const encryptedBuffer = Buffer.from(encryptedBase64, "base64");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", ENCRYPTION_KEY, encryptedBuffer.subarray(0, 12));
+  decipher.setAuthTag(encryptedBuffer.subarray(12, 28));
+  return Buffer.concat([decipher.update(encryptedBuffer.subarray(28)), decipher.final()]).toString("utf8");
+}
+
+// Gera o accessToken (JWT) e o refreshToken (guardado no banco só como hash)
+async function createSession(user) {
+  const accessToken = jsonWebToken.sign({ sub: user.id, roles: user.roles }, JWT_SECRET, {
+    expiresIn: ACCESS_TOKEN_LIFETIME,
+    algorithm: JWT_ALGORITHM,
+    issuer: JWT_ISSUER,
+  });
   const refreshToken = crypto.randomBytes(48).toString("base64url");
-  await query(
+
+  await runQuery(
     "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1,$2, now() + interval '30 days')",
-    [user.id, sha256(refreshToken)]
+    [user.id, hashWithSha256(refreshToken)]
   );
+
   return {
     accessToken,
     refreshToken,
@@ -34,19 +48,27 @@ async function issueSession(user) {
   };
 }
 
-function requireAuth(req, _res, next) {
-  const h = req.headers.authorization || "";
-  if (!h.startsWith("Bearer ")) return next(new ApiError(401, "unauthorized", "Missing access token."));
+// Exige o header "Authorization: Bearer <accessToken>" e preenche request.user
+function requireAuthentication(request, _response, next) {
+  const authorizationHeader = request.headers.authorization || "";
+  if (!authorizationHeader.startsWith("Bearer "))
+    return next(new ApiError(401, "unauthorized", "Missing access token."));
+
   try {
-    const p = jwt.verify(h.slice(7), JWT_SECRET, { algorithms: ["HS256"], issuer: "sheserv-api" });
-    req.user = { id: p.sub, roles: p.roles };
+    const tokenPayload = jsonWebToken.verify(authorizationHeader.slice(7), JWT_SECRET, {
+      algorithms: [JWT_ALGORITHM],
+      issuer: JWT_ISSUER,
+    });
+    request.user = { id: tokenPayload.sub, roles: tokenPayload.roles };
     next();
   } catch {
     next(new ApiError(401, "unauthorized", "Invalid or expired access token."));
   }
 }
 
-const requireRole = (role) => (req, _res, next) =>
-  req.user.roles.includes(role) ? next() : next(new ApiError(403, "forbidden", `Requires role ${role}.`));
+const requireRole = (requiredRole) => (request, _response, next) =>
+  request.user.roles.includes(requiredRole)
+    ? next()
+    : next(new ApiError(403, "forbidden", `Requires role ${requiredRole}.`));
 
-module.exports = { encrypt, decrypt, sha256, issueSession, requireAuth, requireRole };
+module.exports = { encryptText, decryptText, hashWithSha256, createSession, requireAuthentication, requireRole };

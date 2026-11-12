@@ -1,65 +1,93 @@
-const router = require("express").Router();
+const socialRouter = require("express").Router();
 const { z } = require("zod");
-const { query } = require("../db");
-const { ApiError, wrap } = require("../errors");
-const { loadOwnedOrder } = require("./orders");
+const { runQuery } = require("../db");
+const { ApiError, asyncHandler } = require("../errors");
+const { loadOrderForParticipant } = require("./orders");
 
-const maskPhones = (t) => t.replace(/\+?\d[\d\s().-]{7,}\d/g, "[telefone oculto]");
-const other = (o, uid) => (o.customer_id === uid ? o.provider_id : o.customer_id);
+// Troca telefones escritos nas mensagens por um aviso (a conversa não pode vazar contatos)
+const maskPhoneNumbers = (messageText) => messageText.replace(/\+?\d[\d\s().-]{7,}\d/g, "[telefone oculto]");
 
-router.get("/orders/:id/messages", wrap(async (req, res) => {
-  const o = await loadOwnedOrder(req.params.id, req.user.id);
-  const { rows } = await query(
-    `SELECT id, author_id AS "authorId", text, created_at AS "createdAt" FROM messages WHERE order_id=$1 ORDER BY created_at`, [o.id]);
-  res.json(rows);
+// Dado um pedido e um participante, devolve o id do outro participante
+const getOtherParticipantId = (order, userId) =>
+  order.customer_id === userId ? order.provider_id : order.customer_id;
+
+// ---------- Mensagens ----------
+
+socialRouter.get("/orders/:id/messages", asyncHandler(async (request, response) => {
+  const order = await loadOrderForParticipant(request.params.id, request.user.id);
+  const { rows: messages } = await runQuery(
+    `SELECT id, author_id AS "authorId", text, created_at AS "createdAt" FROM messages WHERE order_id=$1 ORDER BY created_at`,
+    [order.id]
+  );
+  response.json(messages);
 }));
 
-router.post("/orders/:id/messages", wrap(async (req, res) => {
-  const { text } = z.object({ text: z.string().trim().min(1).max(1000) }).strict().parse(req.body);
-  const o = await loadOwnedOrder(req.params.id, req.user.id);
-  const { rows } = await query(
+const sendMessageSchema = z.object({ text: z.string().trim().min(1).max(1000) }).strict();
+
+socialRouter.post("/orders/:id/messages", asyncHandler(async (request, response) => {
+  const { text: messageText } = sendMessageSchema.parse(request.body);
+  const order = await loadOrderForParticipant(request.params.id, request.user.id);
+
+  const { rows: createdMessages } = await runQuery(
     `INSERT INTO messages (order_id,author_id,text) VALUES ($1,$2,$3)
      RETURNING id, author_id AS "authorId", text, created_at AS "createdAt"`,
-    [o.id, req.user.id, maskPhones(text)]);
-  res.status(201).json(rows[0]);
+    [order.id, request.user.id, maskPhoneNumbers(messageText)]
+  );
+  response.status(201).json(createdMessages[0]);
 }));
 
-router.post("/orders/:id/reports", wrap(async (req, res) => {
-  const b = z.object({
-    reportedUserId: z.string().uuid(),
-    reason: z.string().min(2).max(60),
-    description: z.string().max(2000).optional(),
-  }).strict().parse(req.body);
-  const o = await loadOwnedOrder(req.params.id, req.user.id);
-  if (b.reportedUserId !== other(o, req.user.id))
+// ---------- Denúncias ----------
+
+const createReportSchema = z.object({
+  reportedUserId: z.string().uuid(),
+  reason: z.string().min(2).max(60),
+  description: z.string().max(2000).optional(),
+}).strict();
+
+socialRouter.post("/orders/:id/reports", asyncHandler(async (request, response) => {
+  const reportData = createReportSchema.parse(request.body);
+  const order = await loadOrderForParticipant(request.params.id, request.user.id);
+
+  if (reportData.reportedUserId !== getOtherParticipantId(order, request.user.id))
     throw new ApiError(422, "validation_error", "Invalid.", { reportedUserId: "Not related to this order." });
-  const { rows } = await query(
+
+  const { rows: createdReports } = await runQuery(
     "INSERT INTO reports (order_id,reporter_id,reported_user_id,reason,description) VALUES ($1,$2,$3,$4,$5) RETURNING id, status",
-    [o.id, req.user.id, b.reportedUserId, b.reason, b.description ?? null]);
-  res.status(201).json(rows[0]);
+    [order.id, request.user.id, reportData.reportedUserId, reportData.reason, reportData.description ?? null]
+  );
+  response.status(201).json(createdReports[0]);
 }));
 
-router.post("/orders/:id/reviews", wrap(async (req, res) => {
-  const b = z.object({
-    rating: z.number().int().min(1).max(5),
-    tags: z.array(z.string().max(40)).max(10).optional(),
-    comment: z.string().max(1000).optional(),
-    tipAmount: z.number().min(0).max(1000).optional(),
-  }).strict().parse(req.body);
-  const o = await loadOwnedOrder(req.params.id, req.user.id);
-  if (o.status !== "completed") throw new ApiError(409, "invalid_state", "Order is not completed.");
-  const direction = o.customer_id === req.user.id ? "customer_to_provider" : "provider_to_customer";
+// ---------- Avaliações ----------
+
+const createReviewSchema = z.object({
+  rating: z.number().int().min(1).max(5),
+  tags: z.array(z.string().max(40)).max(10).optional(),
+  comment: z.string().max(1000).optional(),
+  tipAmount: z.number().min(0).max(1000).optional(),
+}).strict();
+
+socialRouter.post("/orders/:id/reviews", asyncHandler(async (request, response) => {
+  const reviewData = createReviewSchema.parse(request.body);
+  const order = await loadOrderForParticipant(request.params.id, request.user.id);
+  if (order.status !== "completed") throw new ApiError(409, "invalid_state", "Order is not completed.");
+
+  const reviewDirection = order.customer_id === request.user.id ? "customer_to_provider" : "provider_to_customer";
+  // gorjeta só existe quando o cliente avalia a prestadora
+  const tipAmount = reviewDirection === "customer_to_provider" ? reviewData.tipAmount ?? null : null;
+
   try {
-    const { rows } = await query(
+    const { rows: createdReviews } = await runQuery(
       `INSERT INTO reviews (order_id,author_id,target_id,direction,rating,tags,comment,tip_amount)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, rating, tags, comment`,
-      [o.id, req.user.id, other(o, req.user.id), direction, b.rating, b.tags ?? [], b.comment ?? null,
-       direction === "customer_to_provider" ? b.tipAmount ?? null : null]);
-    res.status(201).json(rows[0]);
-  } catch (e) {
-    if (e.code === "23505") throw new ApiError(409, "conflict", "You already reviewed this order.");
-    throw e;
+      [order.id, request.user.id, getOtherParticipantId(order, request.user.id), reviewDirection,
+       reviewData.rating, reviewData.tags ?? [], reviewData.comment ?? null, tipAmount]
+    );
+    response.status(201).json(createdReviews[0]);
+  } catch (databaseError) {
+    if (databaseError.code === "23505") throw new ApiError(409, "conflict", "You already reviewed this order.");
+    throw databaseError;
   }
 }));
 
-module.exports = router;
+module.exports = socialRouter;
