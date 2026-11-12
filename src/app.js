@@ -21,6 +21,7 @@ v1.use(require("./routes/orders").router);
 v1.use("/provider", requireRole("prestadora"), require("./routes/provider"));
 v1.use(require("./routes/safety"));
 v1.use(require("./routes/social"));
+app.use("/api", rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: true, legacyHeaders: false }));
 app.use("/api/v1", v1);
 
 app.use((_req, _res, next) => next(new ApiError(404, "not_found", "Route not found.")));

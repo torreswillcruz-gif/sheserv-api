@@ -3,7 +3,7 @@ const argon2 = require("argon2");
 const { z } = require("zod");
 const { query, tx } = require("../db");
 const { ApiError, wrap } = require("../errors");
-const { issueSession, sha256 } = require("../security");
+const { issueSession, sha256, requireAuth } = require("../security");
 
 const ARGON = { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 }; // OWASP
 
@@ -54,14 +54,29 @@ router.post("/sessions", wrap(async (req, res) => {
 
 router.post("/refresh", wrap(async (req, res) => {
   const { refreshToken } = z.object({ refreshToken: z.string().min(10) }).parse(req.body);
-  const { rows } = await query(
-    `UPDATE refresh_tokens SET revoked=true
-     WHERE token_hash=$1 AND revoked=false AND expires_at>now() RETURNING user_id`,
-    [sha256(refreshToken)]
-  );
-  if (!rows[0]) throw new ApiError(401, "unauthorized", "Invalid refresh token.");
-  const u = (await query("SELECT id,name,email,roles FROM users WHERE id=$1", [rows[0].user_id])).rows[0];
+  const h = sha256(refreshToken);
+  const found = (await query("SELECT user_id, revoked, expires_at FROM refresh_tokens WHERE token_hash=$1", [h])).rows[0];
+  if (!found || new Date(found.expires_at) < new Date())
+    throw new ApiError(401, "unauthorized", "Invalid refresh token.");
+  if (found.revoked) {
+    // token já usado/revogado sendo reapresentado: possível roubo -> encerra todas as sessões
+    await query("UPDATE refresh_tokens SET revoked=true WHERE user_id=$1", [found.user_id]);
+    throw new ApiError(401, "unauthorized", "Invalid refresh token.");
+  }
+  await query("UPDATE refresh_tokens SET revoked=true WHERE token_hash=$1", [h]);
+  const u = (await query("SELECT id,name,email,roles FROM users WHERE id=$1", [found.user_id])).rows[0];
   res.json(await issueSession(u));
+}));
+
+router.post("/logout", wrap(async (req, res) => {
+  const { refreshToken } = z.object({ refreshToken: z.string().min(10) }).parse(req.body);
+  await query("UPDATE refresh_tokens SET revoked=true WHERE token_hash=$1", [sha256(refreshToken)]);
+  res.sendStatus(204);
+}));
+
+router.post("/logout-all", requireAuth, wrap(async (req, res) => {
+  await query("UPDATE refresh_tokens SET revoked=true WHERE user_id=$1", [req.user.id]);
+  res.sendStatus(204);
 }));
 
 // OTP: contrato definido, provedor de SMS ainda não escolhido

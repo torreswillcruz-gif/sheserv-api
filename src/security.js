@@ -21,7 +21,7 @@ function decrypt(b64) {
 }
 
 async function issueSession(user) {
-  const accessToken = jwt.sign({ sub: user.id, roles: user.roles }, JWT_SECRET, { expiresIn: "15m" });
+  const accessToken = jwt.sign({ sub: user.id, roles: user.roles }, JWT_SECRET, { expiresIn: "15m", algorithm: "HS256", issuer: "sheserv-api" });
   const refreshToken = crypto.randomBytes(48).toString("base64url");
   await query(
     "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1,$2, now() + interval '30 days')",
@@ -38,7 +38,7 @@ function requireAuth(req, _res, next) {
   const h = req.headers.authorization || "";
   if (!h.startsWith("Bearer ")) return next(new ApiError(401, "unauthorized", "Missing access token."));
   try {
-    const p = jwt.verify(h.slice(7), JWT_SECRET);
+    const p = jwt.verify(h.slice(7), JWT_SECRET, { algorithms: ["HS256"], issuer: "sheserv-api" });
     req.user = { id: p.sub, roles: p.roles };
     next();
   } catch {
