@@ -46,7 +46,7 @@ router.post("/orders", requireRole("cliente"), wrap(async (req, res) => {
       [b.serviceId])).rows[0];
     if (!s || s.activation_status !== "active") throw new ApiError(404, "not_found", "Service not available.");
 
-    const addr = (await c.query("SELECT 1 FROM addresses WHERE id=$1 AND user_id=$2", [b.addressId, req.user.id])).rows[0];
+    const addr = (await c.query("SELECT 1 FROM addresses WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL", [b.addressId, req.user.id])).rows[0];
     if (!addr) throw new ApiError(404, "not_found", "Address not found.");
 
     const end = new Date(when.getTime() + s.duration_minutes * 60000);

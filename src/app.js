@@ -18,6 +18,7 @@ v1.use("/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders
 v1.use(require("./routes/catalog"));
 v1.use(requireAuth);
 v1.use(require("./routes/orders").router);
+v1.use(require("./routes/addresses"));
 v1.use("/provider", requireRole("prestadora"), require("./routes/provider"));
 v1.use(require("./routes/safety"));
 v1.use(require("./routes/social"));

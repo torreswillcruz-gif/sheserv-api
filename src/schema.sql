@@ -169,3 +169,12 @@ CREATE TABLE IF NOT EXISTS verifications (
 
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_provider ON orders(provider_id, scheduled_at);
+
+-- endereços: campos extras e exclusão lógica (seguro rodar em banco já existente)
+ALTER TABLE addresses ADD COLUMN IF NOT EXISTS number text;
+ALTER TABLE addresses ADD COLUMN IF NOT EXISTS complement text;
+ALTER TABLE addresses ADD COLUMN IF NOT EXISTS neighborhood text;
+ALTER TABLE addresses ADD COLUMN IF NOT EXISTS state text;
+ALTER TABLE addresses ADD COLUMN IF NOT EXISTS postal_code text;
+ALTER TABLE addresses ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+CREATE INDEX IF NOT EXISTS idx_addresses_user ON addresses(user_id);
