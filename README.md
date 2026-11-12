@@ -7,8 +7,10 @@
 
 ## Deploy no Render
 1. Suba para o GitHub.
-2. Render > New + > Blueprint > selecione o repositório (usa o render.yaml, cria API + Postgres).
-3. As tabelas são criadas automaticamente na primeira inicialização.
+2. Render > New + > Blueprint > selecione o repositório (usa o render.yaml).
+3. Quando pedir DATABASE_URL, cole a string do seu banco (AWS RDS). Nunca commite essa string.
+4. No AWS: instância com acesso público e Security Group liberando a porta 5432 para os IPs de saída do Render.
+5. As tabelas são criadas automaticamente na primeira inicialização.
 
 ## Pendências (marcadas como TODO no código)
 - Gateway de pagamento (Pix/cartão)
