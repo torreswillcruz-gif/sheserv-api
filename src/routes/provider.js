@@ -1,6 +1,6 @@
 const router = require("express").Router();
 const { z } = require("zod");
-const { query } = require("../db");
+const { query, tx } = require("../db");
 const { ApiError, wrap } = require("../errors");
 
 router.get("/me/dashboard", wrap(async (req, res) => {
@@ -32,6 +32,44 @@ router.patch("/me/availability", wrap(async (req, res) => {
   const { available } = z.object({ available: z.boolean() }).strict().parse(req.body);
   await query("UPDATE provider_profiles SET available=$1 WHERE user_id=$2", [available, req.user.id]);
   res.json({ available });
+}));
+
+// ---------- perfil da prestadora ----------
+const PROFILE_SQL = `
+  SELECT u.id, u.name, p.bio, p.available, p.verified, p.activation_status AS "activationStatus"
+  FROM provider_profiles p JOIN users u ON u.id=p.user_id WHERE p.user_id=$1`;
+
+router.get("/me/profile", wrap(async (req, res) => {
+  const { rows } = await query(PROFILE_SQL, [req.user.id]);
+  if (!rows[0]) throw new ApiError(404, "not_found", "Provider profile not found.");
+  res.json(rows[0]);
+}));
+
+// activation_status e verified pertencem ao servidor/backoffice: a prestadora não edita
+const profileSchema = z.object({
+  name: z.string().trim().min(2).max(120),
+  bio: z.string().trim().max(500).nullable(),
+  available: z.boolean(),
+}).partial().strict();
+
+router.patch("/me/profile", wrap(async (req, res) => {
+  const b = profileSchema.parse(req.body);
+  if (Object.keys(b).length === 0)
+    throw new ApiError(422, "validation_error", "The request is invalid.", { body: "No fields to update." });
+
+  await tx(async (c) => {
+    const exists = (await c.query("SELECT 1 FROM provider_profiles WHERE user_id=$1 FOR UPDATE", [req.user.id])).rows[0];
+    if (!exists) throw new ApiError(404, "not_found", "Provider profile not found.");
+
+    if (b.name !== undefined) await c.query("UPDATE users SET name=$1 WHERE id=$2", [b.name, req.user.id]);
+
+    const sets = [], vals = [req.user.id];
+    if (b.bio !== undefined) { vals.push(b.bio === "" ? null : b.bio); sets.push(`bio=$${vals.length}`); }
+    if (b.available !== undefined) { vals.push(b.available); sets.push(`available=$${vals.length}`); }
+    if (sets.length) await c.query(`UPDATE provider_profiles SET ${sets.join(", ")} WHERE user_id=$1`, vals);
+  });
+
+  res.json((await query(PROFILE_SQL, [req.user.id])).rows[0]);
 }));
 
 // ---------- serviços da prestadora ----------
