@@ -18,6 +18,7 @@ const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 const ORDER_SELECT_SQL = `
   SELECT
     orders.id,
+    orders.friendly_id AS "friendlyId",
     orders.status,
     orders.service_id AS "serviceId",
     orders.provider_id AS "providerId",

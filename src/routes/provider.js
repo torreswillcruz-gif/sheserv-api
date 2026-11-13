@@ -35,6 +35,7 @@ providerRouter.get("/me/orders", asyncHandler(async (request, response) => {
   const { rows: providerOrders } = await runQuery(
     `SELECT
        orders.id,
+       orders.friendly_id AS "friendlyId",
        orders.status,
        orders.service_id AS "serviceId",
        orders.scheduled_at AS "scheduledAt",

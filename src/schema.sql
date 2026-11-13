@@ -212,3 +212,47 @@ CREATE TABLE IF NOT EXISTS provider_venues (
   longitude double precision NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- ID amigável do pedido: 8 caracteres alfanuméricos, único, gerado pelo banco.
+-- O alfabeto não tem letras/números que se confundem (sem 0, 1, I, L, O).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS friendly_id text;
+
+CREATE OR REPLACE FUNCTION generate_order_friendly_id() RETURNS text AS $$
+DECLARE
+  alphabet CONSTANT text := 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  candidate text;
+  random_bytes bytea;
+  char_position int;
+BEGIN
+  LOOP
+    candidate := '';
+    random_bytes := gen_random_bytes(8);
+    FOR char_position IN 0..7 LOOP
+      candidate := candidate || substr(alphabet, (get_byte(random_bytes, char_position) % length(alphabet)) + 1, 1);
+    END LOOP;
+    -- se o código já existir, sorteia outro
+    EXIT WHEN NOT EXISTS (SELECT 1 FROM orders WHERE friendly_id = candidate);
+  END LOOP;
+  RETURN candidate;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION set_order_friendly_id() RETURNS trigger AS $$
+BEGIN
+  IF NEW.friendly_id IS NULL THEN
+    NEW.friendly_id := generate_order_friendly_id();
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS orders_set_friendly_id ON orders;
+CREATE TRIGGER orders_set_friendly_id
+  BEFORE INSERT ON orders
+  FOR EACH ROW EXECUTE FUNCTION set_order_friendly_id();
+
+-- pedidos que já existiam antes desta regra ganham um código também
+UPDATE orders SET friendly_id = generate_order_friendly_id() WHERE friendly_id IS NULL;
+
+ALTER TABLE orders ALTER COLUMN friendly_id SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS orders_friendly_id_key ON orders (friendly_id);
