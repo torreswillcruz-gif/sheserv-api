@@ -183,11 +183,21 @@ ordersRouter.get("/orders/:id", asyncHandler(async (request, response) => {
 // estado atual -> { próximo estado permitido: quem pode fazer a mudança }
 const ORDER_STATUS_TRANSITIONS = {
   requested: { accepted: "provider", cancelled: "any" },
-  accepted: { on_the_way: "provider", cancelled: "any" },
+  accepted: { cancelled: "any" },
   on_the_way: { in_progress: "provider", cancelled: "any" },
   in_progress: { completed: "provider", disputed: "any" },
   completed: { disputed: "any" },
 };
+//Permite mudança de ator mediante situação de atendimento.
+function allowedActorForTransition(order, nextStatus) {
+  if (order.status === "accepted" && nextStatus === "on_the_way") {
+    if (order.service_location === "at_provider") return "customer";
+    if (order.service_location === "at_customer") return "provider";
+    return null;
+  }
+
+  return ORDER_STATUS_TRANSITIONS[order.status]?.[nextStatus];
+}
 
 async function applyStatusTransition(transactionClient, order, nextStatus, actingUserId, actingRole) {
   const allowedActor = ORDER_STATUS_TRANSITIONS[order.status]?.[nextStatus];
