@@ -18,9 +18,10 @@ const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 const ORDER_SELECT_SQL = `
   SELECT
     orders.id,
-    orders.friendly_id AS "friendlyId",
     orders.status,
     orders.service_id AS "serviceId",
+    (SELECT c.name FROM services s JOIN categories c ON c.id = s.category_id WHERE s.id = orders.service_id) AS "categoryName",
+    orders.friendly_id AS "friendlyId",
     orders.provider_id AS "providerId",
     provider_user.name AS "providerName",
     orders.customer_id AS "customerId",
