@@ -208,7 +208,8 @@ providerRouter.delete("/me/venue", asyncHandler(async (request, response) => {
 
 const MAX_SERVICES_PER_PROVIDER = 30;
 
-const SERVICE_COLUMNS = `id, category_id AS "categoryId", title, base_price::float AS "basePrice",
+const SERVICE_COLUMNS = `id, category_id AS "categoryId",
+  (SELECT name FROM categories WHERE categories.id = services.category_id) AS "categoryName", title, base_price::float AS "basePrice",
   duration_minutes AS "durationMinutes", service_location AS "serviceLocation", active`;
 
 const serviceSchema = z.object({

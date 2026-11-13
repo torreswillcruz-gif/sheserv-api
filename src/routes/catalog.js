@@ -108,12 +108,14 @@ const PROVIDER_SELECT_SQL = `
       SELECT json_agg(json_build_object(
         'id', listed_service.id,
         'categoryId', listed_service.category_id,
+        'categoryName', service_category.name,
         'title', listed_service.title,
         'basePrice', listed_service.base_price::float,
         'durationMinutes', listed_service.duration_minutes,
         'serviceLocation', listed_service.service_location
       ))
       FROM services listed_service
+      JOIN categories service_category ON service_category.id = listed_service.category_id
       WHERE listed_service.provider_id = provider_user.id
         AND listed_service.active
         AND ($1::text IS NULL OR listed_service.category_id = $1::text)
