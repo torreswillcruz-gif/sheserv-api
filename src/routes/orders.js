@@ -200,7 +200,7 @@ function allowedActorForTransition(order, nextStatus) {
 }
 
 async function applyStatusTransition(transactionClient, order, nextStatus, actingUserId, actingRole) {
-  const allowedActor = ORDER_STATUS_TRANSITIONS[order.status]?.[nextStatus];
+  const allowedActor = allowedActorForTransition(order, nextStatus);
   if (!allowedActor || (allowedActor !== "any" && allowedActor !== actingRole))
     throw new ApiError(409, "invalid_transition", `Cannot change from ${order.status} to ${nextStatus}.`);
 
