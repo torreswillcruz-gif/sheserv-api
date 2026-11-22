@@ -44,9 +44,18 @@ quotesRouter.get("/requests", asyncHandler(async (request, response) => {
   const isProvider = request.user.roles?.includes("prestadora");
   const { rows } = await runQuery(
     `SELECT r.*,
+      customer.name AS "customerName",
       (SELECT count(*)::int FROM quotes q
        WHERE q.request_id=r.id AND q.status IN ('open','countered')) AS "openQuoteCount"
+       ,
+      (SELECT count(*)::int FROM quotes q
+       WHERE q.request_id=r.id AND q.provider_id=$1) AS "providerQuoteCount",
+      (SELECT q.status FROM quotes q
+       WHERE q.request_id=r.id AND q.provider_id=$1
+       ORDER BY q.created_at DESC LIMIT 1) AS "providerQuoteStatus",
+      (r.provider_id IS NULL) AS "isPublic"
      FROM service_requests r
+     LEFT JOIN users customer ON customer.id=r.customer_id
      WHERE r.${isProvider ? "provider_id" : "customer_id"}=$1
         OR ($2='provider' AND r.provider_id IS NULL)
      ORDER BY r.created_at DESC LIMIT 100`,
