@@ -304,6 +304,20 @@ providerRouter.patch("/me/services/:id", asyncHandler(async (request, response) 
   if (serviceChanges.categoryId) await assertCategoryExists(serviceChanges.categoryId);
   if (serviceChanges.serviceLocation === "at_provider") await assertProviderHasVenue(request.user.id);
 
+  const { rows: existingServices } = await runQuery(
+    "SELECT price_type,accepts_quotes FROM services WHERE id=$1 AND provider_id=$2 AND active",
+    [request.params.id, request.user.id]
+  );
+  if (!existingServices[0])
+    throw new ApiError(404, "not_found", "Service not found.");
+  const resultingPriceType = serviceChanges.priceType ?? existingServices[0].price_type;
+  const resultingAcceptsQuotes =
+    serviceChanges.acceptsQuotes ?? existingServices[0].accepts_quotes;
+  if (resultingPriceType === "evaluation" && !resultingAcceptsQuotes)
+    throw new ApiError(422, "validation_error", "Evaluation services must accept quotes.", {
+      acceptsQuotes: "Enable quote requests.",
+    });
+
   // $1 = id do serviço, $2 = prestadora dona; os campos alterados começam no $3
   const columnAssignments = changedFields.map(([fieldName], position) => `${SERVICE_FIELD_TO_COLUMN[fieldName]}=$${position + 3}`);
   const changedValues = changedFields.map(([fieldName, fieldValue]) =>
