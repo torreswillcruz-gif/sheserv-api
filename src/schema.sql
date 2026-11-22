@@ -265,6 +265,30 @@ ALTER TABLE services ADD COLUMN IF NOT EXISTS briefing_questions jsonb NOT NULL 
 ALTER TABLE services ADD COLUMN IF NOT EXISTS cancellation_policy text;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS quote_id uuid;
 
+CREATE TABLE IF NOT EXISTS plan_catalog (
+  plan_code text PRIMARY KEY
+    CHECK (plan_code IN ('free', 'standard', 'pro', 'premium')),
+  display_name text NOT NULL,
+  description text,
+  monthly_approval_limit int CHECK (monthly_approval_limit IS NULL OR monthly_approval_limit >= 0),
+  features jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(features) = 'object'),
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO plan_catalog (plan_code,display_name,description,monthly_approval_limit,features)
+VALUES
+  ('free','Grátis','Recursos básicos da prestadora.',20,
+    '{"finance":true,"clients":false,"statistics":false,"promotions":false,"team":false}'::jsonb),
+  ('standard','Standard','Mais solicitações de orçamento por mês.',40,
+    '{"finance":true,"clients":true,"statistics":true,"promotions":false,"team":false}'::jsonb),
+  ('pro','Pro','Limite ampliado de solicitações de orçamento.',100,
+    '{"finance":true,"clients":true,"statistics":true,"promotions":true,"team":false}'::jsonb),
+  ('premium','Premium','Solicitações sem limite fixo e gestão de equipe.',NULL,
+    '{"finance":true,"clients":true,"statistics":true,"promotions":true,"team":true}'::jsonb)
+ON CONFLICT (plan_code) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS provider_plans (
   provider_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   plan_name text NOT NULL DEFAULT 'free'
@@ -273,6 +297,20 @@ CREATE TABLE IF NOT EXISTS provider_plans (
   renewal_at timestamptz NOT NULL DEFAULT date_trunc('month', now()) + interval '1 month',
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE provider_plans DROP CONSTRAINT IF EXISTS provider_plans_plan_name_check;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'provider_plans_plan_name_fkey'
+      AND conrelid = 'provider_plans'::regclass
+  ) THEN
+    ALTER TABLE provider_plans
+      ADD CONSTRAINT provider_plans_plan_name_fkey
+      FOREIGN KEY (plan_name) REFERENCES plan_catalog(plan_code);
+  END IF;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS monthly_approval_usage (
   provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -388,9 +426,14 @@ CREATE TABLE IF NOT EXISTS financial_entries (
   payment_method text,
   service_id uuid REFERENCES services(id),
   customer_id uuid REFERENCES users(id),
+  source_order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
   occurred_at timestamptz NOT NULL DEFAULT now(),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE financial_entries
+  ADD COLUMN IF NOT EXISTS source_order_id uuid REFERENCES orders(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_financial_entries_source_order
+  ON financial_entries(source_order_id) WHERE source_order_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS provider_clients (
   provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,

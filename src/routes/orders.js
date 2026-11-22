@@ -216,6 +216,20 @@ async function applyStatusTransition(transactionClient, order, nextStatus, actin
       "INSERT INTO payouts (order_id,provider_id,amount) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
       [order.id, order.provider_id, roundToTwoDecimals(Number(order.total_amount))]
     );
+    await transactionClient.query(
+      `INSERT INTO financial_entries
+        (provider_id,entry_type,amount,category,description,service_id,customer_id,source_order_id,occurred_at)
+       VALUES ($1,'receivable',$2,'Serviço concluído',$3,$4,$5,$6,now())
+       ON CONFLICT (source_order_id) WHERE source_order_id IS NOT NULL DO NOTHING`,
+      [
+        order.provider_id,
+        roundToTwoDecimals(Number(order.total_amount)),
+        `Repasse pendente do atendimento ${order.friendly_id ?? order.id}`,
+        order.service_id,
+        order.customer_id,
+        order.id,
+      ]
+    );
   }
   if (nextStatus === "cancelled") {
     await transactionClient.query("UPDATE payments SET status='released' WHERE order_id=$1 AND status='held'", [order.id]);

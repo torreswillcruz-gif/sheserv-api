@@ -6,54 +6,60 @@ const { requireRole } = require("../security");
 
 erpRouter.use(requireRole("prestadora"));
 
+function requirePlanFeature(featureName) {
+  return asyncHandler(async (request, _response, next) => {
+    const { rows } = await runQuery(
+      `SELECT COALESCE(plan_catalog.features->$2,'false'::jsonb)='true'::jsonb AS enabled
+       FROM plan_catalog
+       WHERE plan_code=COALESCE(
+         (SELECT plan_name FROM provider_plans WHERE provider_id=$1),'free'
+       )`,
+      [request.user.id, featureName]
+    );
+    if (!rows[0]?.enabled)
+      throw new ApiError(403, "plan_required", "This feature is not enabled for the current plan.");
+    next();
+  });
+}
+
 erpRouter.get("/me/plan", asyncHandler(async (request, response) => {
   const period = new Date().toISOString().slice(0, 7);
-  const [plan, usage, avulsos, stats] = await Promise.all([
-    runQuery("SELECT * FROM provider_plans WHERE provider_id=$1", [request.user.id]),
+  const [plan, availablePlans, usage, purchases, stats] = await Promise.all([
+    runQuery(
+      `SELECT plan_code AS plan,display_name AS "displayName",description,
+        monthly_approval_limit AS "approvalLimit",features,active
+       FROM plan_catalog
+       WHERE plan_code=COALESCE(
+         (SELECT plan_name FROM provider_plans WHERE provider_id=$1),'free'
+       )`,
+      [request.user.id]
+    ),
+    runQuery(
+      `SELECT plan_code AS "planCode",display_name AS "displayName",description,
+        monthly_approval_limit AS "monthlyApprovalLimit",features
+       FROM plan_catalog WHERE active=true
+       ORDER BY array_position(ARRAY['free','standard','pro','premium']::text[],plan_code)`
+    ),
     runQuery("SELECT * FROM monthly_approval_usage WHERE provider_id=$1 AND period=$2", [request.user.id, period]),
     runQuery("SELECT purchase_kind,coalesce(sum(quantity),0)::int AS quantity FROM plan_purchases WHERE provider_id=$1 AND status='active' GROUP BY purchase_kind", [request.user.id]),
     runQuery("SELECT * FROM provider_stats WHERE provider_id=$1", [request.user.id]),
   ]);
   response.json({
-    plan: plan.rows[0]?.plan_name ?? "free",
-    approvalLimit: plan.rows[0]?.monthly_approval_limit ?? 20,
+    plan: plan.rows[0]?.plan ?? "free",
+    displayName: plan.rows[0]?.displayName ?? "Free",
+    description: plan.rows[0]?.description ?? null,
+    approvalLimit: plan.rows[0] ? plan.rows[0].approvalLimit : 20,
+    features: plan.rows[0]?.features ?? { team: false },
+    availablePlans: availablePlans.rows,
     approved: usage.rows[0]?.approved_count ?? 0,
     reserved: usage.rows[0]?.reserved_count ?? 0,
-    avulsos: Object.fromEntries(avulsos.rows.map((row) => [row.purchase_kind, row.quantity])),
+    avulsos: Object.fromEntries(purchases.rows.map((row) => [row.purchase_kind, row.quantity])),
     stats: stats.rows[0] ?? null,
   });
 }));
 
 erpRouter.patch("/me/plan", asyncHandler(async (request, response) => {
-  const data = z.object({
-    plan: z.enum(["free", "standard", "pro", "premium"]),
-  }).strict().parse({
-    plan: String(request.body?.plan ?? "").trim().toLowerCase(),
-  });
-
-  const limits = {
-    free: 20,
-    standard: 40,
-    pro: 100,
-    premium: null,
-  };
-
-  // TODO(payment-gateway): The selected plan can only become effective after
-  // payment authorization in production. Until then, this route exposes the
-  // registered plan change and records its database state for development.
-  const { rows } = await runQuery(
-    `INSERT INTO provider_plans (provider_id,plan_name,monthly_approval_limit,renewal_at,updated_at)
-     VALUES ($1,$2,$3,date_trunc('month',now()) + interval '1 month',now())
-     ON CONFLICT (provider_id) DO UPDATE SET
-       plan_name=EXCLUDED.plan_name,
-       monthly_approval_limit=EXCLUDED.monthly_approval_limit,
-       renewal_at=EXCLUDED.renewal_at,
-       updated_at=now()
-     RETURNING provider_id,plan_name,monthly_approval_limit,renewal_at,updated_at`,
-    [request.user.id, data.plan, limits[data.plan]],
-  );
-
-  response.json(rows[0]);
+  throw new ApiError(403, "plan_change_not_allowed", "Plan changes require verified payment or administrator approval.");
 }));
 
 erpRouter.get("/me/notifications", asyncHandler(async (request, response) => {
@@ -74,16 +80,31 @@ erpRouter.patch("/me/notifications/:id/read", asyncHandler(async (request, respo
   response.json(rows[0]);
 }));
 
-erpRouter.get("/me/financial", asyncHandler(async (request, response) => {
-  const monthStart = new Date();
-  monthStart.setDate(1);
-  monthStart.setHours(0, 0, 0, 0);
+const financialPeriodSchema = z.enum(["week", "month", "quarter", "year"]);
+
+function financialPeriodStart(period) {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  if (period === "week") {
+    start.setDate(start.getDate() - 6);
+  } else if (period === "year") {
+    start.setMonth(0, 1);
+  } else {
+    start.setDate(1);
+    if (period === "quarter") start.setMonth(start.getMonth() - 2);
+  }
+  return start;
+}
+
+erpRouter.get("/me/financial", requirePlanFeature("finance"), asyncHandler(async (request, response) => {
+  const period = financialPeriodSchema.default("month").parse(request.query.period);
+  const periodStart = financialPeriodStart(period);
   const { rows } = await runQuery(
     `SELECT entry_type AS "entryType",coalesce(sum(amount),0)::float AS total
      FROM financial_entries
      WHERE provider_id=$1 AND occurred_at>= $2
      GROUP BY entry_type`,
-    [request.user.id, monthStart]
+    [request.user.id, periodStart]
   );
   const summary = Object.fromEntries(rows.map((row) => [row.entryType, row.total]));
   response.json({
@@ -94,12 +115,96 @@ erpRouter.get("/me/financial", asyncHandler(async (request, response) => {
   });
 }));
 
-erpRouter.get("/me/financial/entries", asyncHandler(async (request, response) => {
+function cashFlowLabels(period, start) {
+  if (period === "week") {
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(start);
+      date.setDate(start.getDate() + index);
+      const weekday = new Intl.DateTimeFormat("pt-BR", { weekday: "short" })
+        .format(date)
+        .replace(".", "");
+      return `${weekday} ${String(date.getDate()).padStart(2, "0")}`;
+    });
+  }
+  if (period === "year") {
+    return ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+  }
+  const daysInMonth = new Date(start.getFullYear(), start.getMonth() + 1, 0).getDate();
+  return Array.from(
+    { length: Math.ceil(daysInMonth / 7) },
+    (_, index) => `${index * 7 + 1}-${Math.min(index * 7 + 7, daysInMonth)}`,
+  );
+}
+
+erpRouter.get("/me/financial/dashboard", requirePlanFeature("finance"), asyncHandler(async (request, response) => {
+  const period = z.enum(["week", "month", "year"]).default("month").parse(request.query.period);
+  const periodStart = financialPeriodStart(period);
+  const bucketIndex = period === "week"
+    ? "(occurred_at::date - $2::date)::int"
+    : period === "year"
+      ? "(extract(month from occurred_at)::int - 1)"
+      : "floor((extract(day from occurred_at) - 1) / 7)::int";
+  const [summaryResult, entriesResult, cashFlowResult] = await Promise.all([
+    runQuery(
+      `SELECT entry_type AS "entryType",coalesce(sum(amount),0)::float AS total
+       FROM financial_entries
+       WHERE provider_id=$1 AND occurred_at >= $2
+       GROUP BY entry_type`,
+      [request.user.id, periodStart],
+    ),
+    runQuery(
+      `SELECT id,entry_type AS "entryType",amount::float,category,description,
+              occurred_at AS "occurredAt",customer_id AS "customerId",
+              source_order_id AS "sourceOrderId"
+       FROM financial_entries
+       WHERE provider_id=$1 AND occurred_at >= $2
+       ORDER BY occurred_at DESC LIMIT 200`,
+      [request.user.id, periodStart],
+    ),
+    runQuery(
+      `SELECT ${bucketIndex} AS "bucketIndex",
+              coalesce(sum(amount) FILTER (WHERE entry_type='income'),0)::float AS income,
+              coalesce(sum(amount) FILTER (WHERE entry_type='expense'),0)::float AS expense
+       FROM financial_entries
+       WHERE provider_id=$1 AND occurred_at >= $2
+         AND entry_type IN ('income','expense')
+       GROUP BY 1 ORDER BY 1`,
+      [request.user.id, periodStart],
+    ),
+  ]);
+  const totals = Object.fromEntries(
+    summaryResult.rows.map((row) => [row.entryType, row.total]),
+  );
+  const labels = cashFlowLabels(period, periodStart);
+  const buckets = new Map(
+    cashFlowResult.rows.map((row) => [Number(row.bucketIndex), row]),
+  );
+  response.json({
+    summary: {
+      income: totals.income ?? 0,
+      expense: totals.expense ?? 0,
+      receivable: totals.receivable ?? 0,
+      profit: (totals.income ?? 0) - (totals.expense ?? 0),
+    },
+    entries: entriesResult.rows,
+    cashFlow: labels.map((label, index) => ({
+      label,
+      income: buckets.get(index)?.income ?? 0,
+      expense: buckets.get(index)?.expense ?? 0,
+    })),
+  });
+}));
+
+erpRouter.get("/me/financial/entries", requirePlanFeature("finance"), asyncHandler(async (request, response) => {
+  const period = financialPeriodSchema.default("month").parse(request.query.period);
+  const periodStart = financialPeriodStart(period);
   const { rows } = await runQuery(
-    `SELECT id,entry_type AS "entryType",amount::float,category,description,payment_method AS "paymentMethod",
-            occurred_at AS "occurredAt",customer_id AS "customerId"
-     FROM financial_entries WHERE provider_id=$1 ORDER BY occurred_at DESC LIMIT 200`,
-    [request.user.id]
+    `    SELECT id,entry_type AS "entryType",amount::float,category,description,payment_method AS "paymentMethod",
+           occurred_at AS "occurredAt",customer_id AS "customerId",
+           source_order_id AS "sourceOrderId"
+     FROM financial_entries WHERE provider_id=$1 AND occurred_at>= $2
+     ORDER BY occurred_at DESC LIMIT 200`,
+    [request.user.id, periodStart]
   );
   response.json(rows);
 }));
@@ -114,7 +219,7 @@ const entrySchema = z.object({
   occurredAt: z.string().datetime({ offset: true }).optional(),
 }).strict();
 
-erpRouter.post("/me/financial/entries", asyncHandler(async (request, response) => {
+erpRouter.post("/me/financial/entries", requirePlanFeature("finance"), asyncHandler(async (request, response) => {
   const data = entrySchema.parse(request.body);
   const { rows } = await runQuery(
     `INSERT INTO financial_entries
@@ -128,7 +233,7 @@ erpRouter.post("/me/financial/entries", asyncHandler(async (request, response) =
   response.status(201).json(rows[0]);
 }));
 
-erpRouter.get("/me/clients", asyncHandler(async (request, response) => {
+erpRouter.get("/me/clients", requirePlanFeature("clients"), asyncHandler(async (request, response) => {
   const { rows } = await runQuery(
     `SELECT c.customer_id AS "customerId",u.name,u.email,c.tags,c.notes,c.birthday,c.next_contact_at AS "nextContactAt"
      FROM provider_clients c JOIN users u ON u.id=c.customer_id
@@ -138,7 +243,7 @@ erpRouter.get("/me/clients", asyncHandler(async (request, response) => {
   response.json(rows);
 }));
 
-erpRouter.put("/me/clients/:customerId", asyncHandler(async (request, response) => {
+erpRouter.put("/me/clients/:customerId", requirePlanFeature("clients"), asyncHandler(async (request, response) => {
   const data = z.object({
     tags: z.array(z.string().trim().min(1).max(30)).max(20).default([]),
     notes: z.string().trim().max(3000).nullable().optional(),
@@ -158,25 +263,91 @@ erpRouter.put("/me/clients/:customerId", asyncHandler(async (request, response) 
   response.json(rows[0]);
 }));
 
-erpRouter.get("/me/stats", asyncHandler(async (request, response) => {
+erpRouter.get("/me/stats", requirePlanFeature("statistics"), asyncHandler(async (request, response) => {
   const period = new Date().toISOString().slice(0, 7);
+  const yearStart = new Date();
+  yearStart.setMonth(0, 1);
+  yearStart.setHours(0, 0, 0, 0);
   const [stored, usage] = await Promise.all([
     runQuery("SELECT * FROM provider_stats WHERE provider_id=$1", [request.user.id]),
     runQuery("SELECT * FROM monthly_approval_usage WHERE provider_id=$1 AND period=$2", [request.user.id, period]),
   ]);
+  const [completed, monthlyOrders, monthlyFinancial] = await Promise.all([
+    runQuery(
+      `SELECT count(*)::int AS "completedServices",
+              count(DISTINCT customer_id)::int AS "clientsServed",
+              coalesce(sum(total_amount),0)::float AS "completedValue"
+       FROM orders WHERE provider_id=$1 AND status='completed'`,
+      [request.user.id],
+    ),
+    runQuery(
+      `SELECT extract(month from coalesce(completion.completed_at, orders.scheduled_at))::int AS month,
+              count(*)::int AS "completedServices",
+              count(DISTINCT orders.customer_id)::int AS "clientsServed"
+       FROM orders
+       LEFT JOIN LATERAL (
+         SELECT max(created_at) AS completed_at
+         FROM order_events
+         WHERE order_id=orders.id AND type='status_changed'
+           AND data->>'to'='completed'
+       ) completion ON true
+       WHERE orders.provider_id=$1 AND orders.status='completed'
+         AND coalesce(completion.completed_at, orders.scheduled_at) >= $2
+       GROUP BY 1 ORDER BY 1`,
+      [request.user.id, yearStart],
+    ),
+    runQuery(
+      `SELECT extract(month from occurred_at)::int AS month,
+              coalesce(sum(amount) FILTER (WHERE entry_type='income'),0)::float AS income,
+              coalesce(sum(amount) FILTER (WHERE entry_type='expense'),0)::float AS expense
+       FROM financial_entries
+       WHERE provider_id=$1 AND occurred_at >= $2
+       GROUP BY 1 ORDER BY 1`,
+      [request.user.id, yearStart],
+    ),
+  ]);
   const stats = stored.rows[0] ?? {};
   const approved = usage.rows[0]?.approved_count ?? 0;
   const sent = stats.quote_sent ?? 0;
+  const completedSummary = completed.rows[0];
+  const monthly = new Map();
+  for (const row of monthlyOrders.rows) {
+    monthly.set(Number(row.month), { ...row });
+  }
+  for (const row of monthlyFinancial.rows) {
+    const month = Number(row.month);
+    monthly.set(month, { ...(monthly.get(month) ?? {}), ...row });
+  }
+  const monthlyActivity = Array.from({ length: 12 }, (_, index) => {
+    const month = index + 1;
+    const activity = monthly.get(month) ?? {};
+    return {
+      label: new Intl.DateTimeFormat("pt-BR", { month: "short", timeZone: "UTC" })
+        .format(new Date(Date.UTC(yearStart.getFullYear(), index, 1)))
+        .replace(".", ""),
+      completedServices: Number(activity.completedServices ?? 0),
+      clientsServed: Number(activity.clientsServed ?? 0),
+      income: Number(activity.income ?? 0),
+      expense: Number(activity.expense ?? 0),
+    };
+  });
+  const completedServices = Number(completedSummary.completedServices ?? 0);
+  const completedValue = Number(completedSummary.completedValue ?? 0);
   response.json({
     profileViews: stats.profile_views ?? 0,
     quotesSent: sent,
     quotesApproved: stats.quote_approved ?? approved,
     conversion: sent === 0 ? 0 : ((stats.quote_approved ?? approved) / sent) * 100,
     averageResponseMinutes: stats.average_response_minutes ?? null,
+    completedServices,
+    clientsServed: Number(completedSummary.clientsServed ?? 0),
+    completedValue,
+    averageServiceValue: completedServices === 0 ? 0 : completedValue / completedServices,
+    monthlyActivity,
   });
 }));
 
-erpRouter.get("/me/promotions", asyncHandler(async (request, response) => {
+erpRouter.get("/me/promotions", requirePlanFeature("promotions"), asyncHandler(async (request, response) => {
   const { rows } = await runQuery(
     "SELECT * FROM promotions WHERE provider_id=$1 ORDER BY created_at DESC",
     [request.user.id]
@@ -184,7 +355,7 @@ erpRouter.get("/me/promotions", asyncHandler(async (request, response) => {
   response.json(rows);
 }));
 
-erpRouter.post("/me/promotions", asyncHandler(async (request, response) => {
+erpRouter.post("/me/promotions", requirePlanFeature("promotions"), asyncHandler(async (request, response) => {
   const data = z.object({
     serviceId: z.string().uuid().nullable().optional(),
     message: z.string().trim().min(10).max(500),
@@ -224,10 +395,7 @@ erpRouter.post("/me/purchases", asyncHandler(async (request, response) => {
   response.status(201).json(rows[0]);
 }));
 
-erpRouter.get("/me/team", asyncHandler(async (request, response) => {
-  const plan = await runQuery("SELECT plan_name FROM provider_plans WHERE provider_id=$1", [request.user.id]);
-  if ((plan.rows[0]?.plan_name ?? "free") !== "premium")
-    throw new ApiError(403, "plan_required", "Team is available only for Premium.");
+erpRouter.get("/me/team", requirePlanFeature("team"), asyncHandler(async (request, response) => {
   const { rows } = await runQuery(
     "SELECT * FROM team_members WHERE provider_id=$1 ORDER BY created_at DESC",
     [request.user.id]
@@ -235,10 +403,7 @@ erpRouter.get("/me/team", asyncHandler(async (request, response) => {
   response.json(rows);
 }));
 
-erpRouter.post("/me/team", asyncHandler(async (request, response) => {
-  const plan = await runQuery("SELECT plan_name FROM provider_plans WHERE provider_id=$1", [request.user.id]);
-  if ((plan.rows[0]?.plan_name ?? "free") !== "premium")
-    throw new ApiError(403, "plan_required", "Team is available only for Premium.");
+erpRouter.post("/me/team", requirePlanFeature("team"), asyncHandler(async (request, response) => {
   const data = z.object({
     email: z.string().email(),
     role: z.enum(["assistant", "manager"]).default("assistant"),

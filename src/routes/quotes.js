@@ -105,12 +105,13 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
 
     const period = new Date().toISOString().slice(0, 7);
     const { rows: planRows } = await transaction.query(
-      "SELECT plan_name,monthly_approval_limit FROM provider_plans WHERE provider_id=$1",
+      `SELECT monthly_approval_limit FROM plan_catalog
+       WHERE plan_code=COALESCE(
+         (SELECT plan_name FROM provider_plans WHERE provider_id=$1),'free'
+       )`,
       [request.user.id]
     );
-    const planName = planRows[0]?.plan_name ?? "free";
-    const planLimit = planRows[0]?.monthly_approval_limit ??
-      (planName === "free" ? 20 : planName === "standard" ? 40 : planName === "pro" ? 100 : null);
+    const planLimit = planRows[0] ? planRows[0].monthly_approval_limit : 20;
     const { rows: usageRows } = await transaction.query(
       `INSERT INTO monthly_approval_usage (provider_id,period,approved_count,reserved_count)
        VALUES ($1,$2,0,0)
