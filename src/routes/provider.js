@@ -211,15 +211,21 @@ const MAX_SERVICES_PER_PROVIDER = 30;
 
 const SERVICE_COLUMNS = `id, category_id AS "categoryId",
   (SELECT name FROM categories WHERE categories.id = services.category_id) AS "categoryName", title, base_price::float AS "basePrice",
-  duration_minutes AS "durationMinutes", service_location AS "serviceLocation", active`;
+  duration_minutes AS "durationMinutes", service_location AS "serviceLocation",
+  price_type AS "priceType", accepts_quotes AS "acceptsQuotes",
+  briefing_questions AS "briefingQuestions", cancellation_policy AS "cancellationPolicy", active`;
 
 const serviceSchema = z.object({
   categoryId: z.string().min(1).max(100),
   title: z.string().trim().min(3).max(120),
-  basePrice: z.number().positive().max(100000).transform((price) => Math.round(price * 100) / 100),
+  basePrice: z.number().nonnegative().max(100000).transform((price) => Math.round(price * 100) / 100),
   durationMinutes: z.number().int().min(15).max(720),
   // "at_customer": a prestadora vai até o cliente. "at_provider": o cliente vai até a prestadora.
   serviceLocation: z.enum(["at_customer", "at_provider"]).default("at_customer"),
+  priceType: z.enum(["fixed", "from", "evaluation"]).default("fixed"),
+  acceptsQuotes: z.boolean().default(false),
+  briefingQuestions: z.array(z.string().trim().min(2).max(300)).max(30).default([]),
+  cancellationPolicy: z.string().trim().max(1000).nullable().optional(),
 }).strict();
 
 // campo enviado pelo app -> coluna do banco
@@ -229,6 +235,10 @@ const SERVICE_FIELD_TO_COLUMN = {
   basePrice: "base_price",
   durationMinutes: "duration_minutes",
   serviceLocation: "service_location",
+  priceType: "price_type",
+  acceptsQuotes: "accepts_quotes",
+  briefingQuestions: "briefing_questions",
+  cancellationPolicy: "cancellation_policy",
 };
 
 async function assertCategoryExists(categoryId) {
@@ -259,6 +269,12 @@ providerRouter.post("/me/services", asyncHandler(async (request, response) => {
   const serviceData = serviceSchema.parse(request.body);
   await assertCategoryExists(serviceData.categoryId);
   if (serviceData.serviceLocation === "at_provider") await assertProviderHasVenue(request.user.id);
+  if (serviceData.priceType === "fixed" && serviceData.basePrice <= 0)
+    throw new ApiError(422, "validation_error", "Fixed price must be greater than zero.", { basePrice: "Invalid fixed price." });
+  if (serviceData.priceType === "evaluation" && !serviceData.acceptsQuotes)
+    throw new ApiError(422, "validation_error", "Evaluation services must accept quotes.", { acceptsQuotes: "Enable quote requests." });
+  if (serviceData.priceType === "evaluation" && serviceData.briefingQuestions.length === 0)
+    throw new ApiError(422, "validation_error", "Evaluation services require briefing questions.", { briefingQuestions: "Add at least one question." });
 
   const { rows: countRows } = await runQuery(
     "SELECT count(*)::int AS total FROM services WHERE provider_id=$1 AND active",
@@ -269,10 +285,11 @@ providerRouter.post("/me/services", asyncHandler(async (request, response) => {
 
   // provider_id vem sempre do token
   const { rows: createdServices } = await runQuery(
-    `INSERT INTO services (provider_id, category_id, title, base_price, duration_minutes, service_location)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING ${SERVICE_COLUMNS}`,
+    `INSERT INTO services (provider_id, category_id, title, base_price, duration_minutes, service_location, price_type, accepts_quotes, briefing_questions, cancellation_policy)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING ${SERVICE_COLUMNS}`,
     [request.user.id, serviceData.categoryId, serviceData.title, serviceData.basePrice,
-     serviceData.durationMinutes, serviceData.serviceLocation]
+     serviceData.durationMinutes, serviceData.serviceLocation, serviceData.priceType,
+     serviceData.acceptsQuotes, JSON.stringify(serviceData.briefingQuestions), serviceData.cancellationPolicy ?? null]
   );
   response.status(201).json(createdServices[0]);
 }));
@@ -289,9 +306,12 @@ providerRouter.patch("/me/services/:id", asyncHandler(async (request, response) 
 
   // $1 = id do serviço, $2 = prestadora dona; os campos alterados começam no $3
   const columnAssignments = changedFields.map(([fieldName], position) => `${SERVICE_FIELD_TO_COLUMN[fieldName]}=$${position + 3}`);
+  const changedValues = changedFields.map(([fieldName, fieldValue]) =>
+    fieldName === "briefingQuestions" ? JSON.stringify(fieldValue) : fieldValue
+  );
   const { rows: updatedServices } = await runQuery(
     `UPDATE services SET ${columnAssignments.join(", ")} WHERE id=$1 AND provider_id=$2 AND active RETURNING ${SERVICE_COLUMNS}`,
-    [request.params.id, request.user.id, ...changedFields.map(([, fieldValue]) => fieldValue)]
+    [request.params.id, request.user.id, ...changedValues]
   );
   if (!updatedServices[0]) throw new ApiError(404, "not_found", "Service not found.");
   response.json(updatedServices[0]);

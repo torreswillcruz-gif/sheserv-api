@@ -112,7 +112,11 @@ const PROVIDER_SELECT_SQL = `
         'title', listed_service.title,
         'basePrice', listed_service.base_price::float,
         'durationMinutes', listed_service.duration_minutes,
-        'serviceLocation', listed_service.service_location
+        'serviceLocation', listed_service.service_location,
+        'priceType', listed_service.price_type,
+        'acceptsQuotes', listed_service.accepts_quotes,
+        'briefingQuestions', listed_service.briefing_questions,
+        'cancellationPolicy', listed_service.cancellation_policy
       ))
       FROM services listed_service
       JOIN categories service_category ON service_category.id = listed_service.category_id

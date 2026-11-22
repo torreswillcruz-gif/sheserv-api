@@ -6,7 +6,6 @@ const { ApiError, asyncHandler } = require("../errors");
 const { requireRole } = require("../security");
 const { isValidUuid } = require("../validation");
 
-const COMMISSION_RATE = Number(process.env.COMMISSION_RATE || 0.12);
 const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 
 // $1 = id de quem está logado.
@@ -129,10 +128,10 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
     if (conflictingOrders[0])
       throw new ApiError(409, "conflict", "Slot unavailable.", { scheduledAt: "The selected time is no longer available." });
 
-    // Preço e comissão são sempre calculados aqui, nunca vêm do app
+    // Preço calculado pelo servidor; não há comissão da plataforma.
     const basePrice = Number(service.base_price);
-    const commission = roundToTwoDecimals(basePrice * COMMISSION_RATE);
-    const totalAmount = roundToTwoDecimals(basePrice + commission);
+    const commission = 0;
+    const totalAmount = roundToTwoDecimals(basePrice);
     const checkInCode = String(crypto.randomInt(0, 10000)).padStart(4, "0");
 
     const { rows: insertedOrders } = await transactionClient.query(
@@ -204,7 +203,7 @@ async function applyStatusTransition(transactionClient, order, nextStatus, actin
     await transactionClient.query("UPDATE payments SET status='captured' WHERE order_id=$1", [order.id]);
     await transactionClient.query(
       "INSERT INTO payouts (order_id,provider_id,amount) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
-      [order.id, order.provider_id, roundToTwoDecimals(Number(order.total_amount) - Number(order.commission))]
+      [order.id, order.provider_id, roundToTwoDecimals(Number(order.total_amount))]
     );
   }
   if (nextStatus === "cancelled") {

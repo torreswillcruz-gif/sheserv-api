@@ -19,3 +19,17 @@
 - Notificação de SOS
 - Filtro por distância (falta área de atendimento no ERD)
 - Ativação de prestadoras (activation_status) é feita pelo backoffice
+
+## Solicitações e orçamentos
+- `POST /api/v1/requests` cria uma solicitação.
+- `GET /api/v1/requests` lista solicitações do cliente ou da prestadora.
+- `POST /api/v1/requests/{id}/quotes` envia uma proposta e reserva 1 cota.
+- `POST /api/v1/quotes/{id}/approve` aprova uma proposta e encerra as demais.
+- `GET/POST /api/v1/quotes/{id}/messages` lista e envia mensagens da negociação.
+- `POST /api/v1/quotes/{id}/counter` salva uma contraproposta e nova validade.
+- `POST /api/v1/quotes/{id}/reject` recusa uma proposta.
+- Mini-ERP: `/api/v1/me/plan`, `/financial`, `/clients`, `/stats`, `/promotions`,
+  `/purchases`, `/team` e `/notifications`.
+- O pagamento externo continua dependente de gateway aprovado e conta da loja.
+- Máximo de 3 orçamentos abertos por solicitação.
+- Limites mensais: Gratuito 20; Standard 40; Pro 100; Premium ilimitado.

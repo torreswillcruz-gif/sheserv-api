@@ -256,3 +256,197 @@ UPDATE orders SET friendly_id = generate_order_friendly_id() WHERE friendly_id I
 
 ALTER TABLE orders ALTER COLUMN friendly_id SET NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS orders_friendly_id_key ON orders (friendly_id);
+
+-- Modelo de planos, solicitações e orçamentos
+ALTER TABLE services ADD COLUMN IF NOT EXISTS price_type text NOT NULL DEFAULT 'fixed'
+  CHECK (price_type IN ('fixed', 'from', 'evaluation'));
+ALTER TABLE services ADD COLUMN IF NOT EXISTS accepts_quotes boolean NOT NULL DEFAULT false;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS briefing_questions jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS cancellation_policy text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS quote_id uuid;
+
+CREATE TABLE IF NOT EXISTS provider_plans (
+  provider_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  plan_name text NOT NULL DEFAULT 'free'
+    CHECK (plan_name IN ('free', 'standard', 'pro', 'premium')),
+  monthly_approval_limit int,
+  renewal_at timestamptz NOT NULL DEFAULT date_trunc('month', now()) + interval '1 month',
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS monthly_approval_usage (
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  period text NOT NULL,
+  approved_count int NOT NULL DEFAULT 0,
+  reserved_count int NOT NULL DEFAULT 0,
+  PRIMARY KEY (provider_id, period),
+  CHECK (approved_count >= 0),
+  CHECK (reserved_count >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS service_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  customer_id uuid NOT NULL REFERENCES users(id),
+  provider_id uuid REFERENCES users(id),
+  service_id uuid REFERENCES services(id),
+  status text NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open', 'with_quotes', 'accepted', 'cancelled', 'expired')),
+  description text,
+  brief_answers jsonb NOT NULL DEFAULT '{}'::jsonb,
+  photo_urls text[] NOT NULL DEFAULT '{}',
+  address_id uuid REFERENCES addresses(id),
+  date_window_start timestamptz,
+  date_window_end timestamptz,
+  estimated_value numeric(10,2),
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS quotes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id uuid NOT NULL REFERENCES service_requests(id) ON DELETE CASCADE,
+  provider_id uuid NOT NULL REFERENCES users(id),
+  customer_id uuid NOT NULL REFERENCES users(id),
+  status text NOT NULL DEFAULT 'draft'
+    CHECK (status IN ('draft', 'open', 'countered', 'approved', 'rejected', 'expired', 'cancelled')),
+  total_amount numeric(10,2) NOT NULL,
+  valid_until timestamptz NOT NULL,
+  terms text,
+  reserved_quota boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS quote_items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  quote_id uuid NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+  service_id uuid REFERENCES services(id),
+  description text NOT NULL,
+  quantity numeric(10,2) NOT NULL DEFAULT 1 CHECK (quantity > 0),
+  unit_price numeric(10,2) NOT NULL CHECK (unit_price >= 0),
+  kind text NOT NULL DEFAULT 'service'
+    CHECK (kind IN ('service', 'travel', 'discount', 'additional'))
+);
+
+CREATE TABLE IF NOT EXISTS quote_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  quote_id uuid NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+  actor_id uuid REFERENCES users(id),
+  type text NOT NULL,
+  data jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_requests_customer ON service_requests(customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_service_requests_provider ON service_requests(provider_id, status);
+CREATE INDEX IF NOT EXISTS idx_quotes_request ON quotes(request_id, status);
+CREATE INDEX IF NOT EXISTS idx_quotes_provider ON quotes(provider_id, status);
+
+CREATE TABLE IF NOT EXISTS quote_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  quote_id uuid NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+  author_id uuid NOT NULL REFERENCES users(id),
+  text text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS quote_versions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  quote_id uuid NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+  author_id uuid NOT NULL REFERENCES users(id),
+  total_amount numeric(10,2) NOT NULL,
+  valid_until timestamptz NOT NULL,
+  terms text,
+  change_type text NOT NULL CHECK (change_type IN ('counter', 'revision')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_quote_messages_quote ON quote_messages(quote_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_quote_versions_quote ON quote_versions(quote_id, created_at);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type text NOT NULL,
+  title text NOT NULL,
+  body text,
+  read boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS financial_entries (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  entry_type text NOT NULL CHECK (entry_type IN ('income','expense','receivable')),
+  amount numeric(10,2) NOT NULL CHECK (amount >= 0),
+  category text NOT NULL,
+  description text,
+  payment_method text,
+  service_id uuid REFERENCES services(id),
+  customer_id uuid REFERENCES users(id),
+  occurred_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS provider_clients (
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  customer_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  tags text[] NOT NULL DEFAULT '{}',
+  notes text,
+  birthday date,
+  next_contact_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider_id, customer_id)
+);
+
+CREATE TABLE IF NOT EXISTS provider_stats (
+  provider_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  profile_views int NOT NULL DEFAULT 0,
+  quote_sent int NOT NULL DEFAULT 0,
+  quote_approved int NOT NULL DEFAULT 0,
+  average_response_minutes int,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS promotions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  service_id uuid REFERENCES services(id),
+  message text NOT NULL,
+  radius_km numeric(8,2) NOT NULL,
+  starts_at timestamptz NOT NULL,
+  ends_at timestamptz NOT NULL,
+  status text NOT NULL DEFAULT 'draft'
+    CHECK (status IN ('draft','active','ended','cancelled','pending_review')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS plan_purchases (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  store_product_id text NOT NULL,
+  purchase_kind text NOT NULL CHECK (purchase_kind IN ('subscription','approval_pack','promotion_pack','featured')),
+  quantity int NOT NULL DEFAULT 1 CHECK (quantity > 0),
+  expires_at timestamptz,
+  status text NOT NULL DEFAULT 'active',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS team_members (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  invited_user_id uuid REFERENCES users(id),
+  email text NOT NULL,
+  role text NOT NULL DEFAULT 'assistant'
+    CHECK (role IN ('assistant','manager')),
+  permissions jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'invited'
+    CHECK (status IN ('invited','active','removed')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (provider_id, email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_financial_provider ON financial_entries(provider_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_provider_clients ON provider_clients(provider_id);
