@@ -44,7 +44,8 @@ quotesRouter.get("/requests", asyncHandler(async (request, response) => {
   const isProvider = request.user.roles?.includes("prestadora");
   const { rows } = await runQuery(
     `SELECT r.*,
-      (SELECT count(*)::int FROM quotes q WHERE q.request_id=r.id AND q.status='open') AS "openQuoteCount"
+      (SELECT count(*)::int FROM quotes q
+       WHERE q.request_id=r.id AND q.status IN ('open','countered')) AS "openQuoteCount"
      FROM service_requests r
      WHERE r.${isProvider ? "provider_id" : "customer_id"}=$1
         OR ($2='provider' AND r.provider_id IS NULL)
@@ -81,11 +82,17 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
       throw new ApiError(403, "forbidden", "This request belongs to another provider.");
 
     const { rows: openRows } = await transaction.query(
-      "SELECT count(*)::int AS total FROM quotes WHERE request_id=$1 AND status='open'",
+      "SELECT count(*)::int AS total FROM quotes WHERE request_id=$1 AND status IN ('open','countered')",
       [serviceRequest.id]
     );
     if (openRows[0].total >= 3)
       throw new ApiError(409, "quota_limit", "This request already has 3 open quotes.");
+    const { rows: providerRows } = await transaction.query(
+      "SELECT 1 FROM quotes WHERE request_id=$1 AND provider_id=$2 AND status IN ('open','countered')",
+      [serviceRequest.id, request.user.id]
+    );
+    if (providerRows[0])
+      throw new ApiError(409, "duplicate_quote", "You already sent an open quote for this request.");
 
     const period = new Date().toISOString().slice(0, 7);
     const { rows: planRows } = await transaction.query(
@@ -124,8 +131,8 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
       );
     }
     await transaction.query(
-      "UPDATE service_requests SET status='with_quotes',provider_id=COALESCE(provider_id,$2),updated_at=now() WHERE id=$1",
-      [serviceRequest.id, request.user.id]
+      "UPDATE service_requests SET status='with_quotes',updated_at=now() WHERE id=$1",
+      [serviceRequest.id]
     );
     await transaction.query(
       "INSERT INTO quote_events (quote_id,actor_id,type,data) VALUES ($1,$2,'sent',$3)",
@@ -224,7 +231,10 @@ quotesRouter.post("/quotes/:id/approve", requireRole("cliente"), asyncHandler(as
       "UPDATE quotes SET status='rejected',updated_at=now() WHERE request_id=$1 AND id<>$2 AND status='open'",
       [quote.request_id, quote.id]
     );
-    await transaction.query("UPDATE service_requests SET status='accepted',updated_at=now() WHERE id=$1", [quote.request_id]);
+    await transaction.query(
+      "UPDATE service_requests SET status='accepted',provider_id=$2,updated_at=now() WHERE id=$1",
+      [quote.request_id, quote.provider_id]
+    );
     const period = new Date().toISOString().slice(0, 7);
     await transaction.query(
       `UPDATE monthly_approval_usage
