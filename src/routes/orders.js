@@ -17,9 +17,10 @@ const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 const ORDER_SELECT_SQL = `
   SELECT
     orders.id,
-    orders.friendly_id AS "friendlyId",
     orders.status,
     orders.service_id AS "serviceId",
+    (SELECT c.name FROM services s JOIN categories c ON c.id = s.category_id WHERE s.id = orders.service_id) AS "categoryName",
+    orders.friendly_id AS "friendlyId",
     orders.provider_id AS "providerId",
     provider_user.name AS "providerName",
     orders.customer_id AS "customerId",
@@ -182,14 +183,24 @@ ordersRouter.get("/orders/:id", asyncHandler(async (request, response) => {
 // estado atual -> { próximo estado permitido: quem pode fazer a mudança }
 const ORDER_STATUS_TRANSITIONS = {
   requested: { accepted: "provider", cancelled: "any" },
-  accepted: { on_the_way: "provider", cancelled: "any" },
+  accepted: { cancelled: "any" },
   on_the_way: { in_progress: "provider", cancelled: "any" },
   in_progress: { completed: "provider", disputed: "any" },
   completed: { disputed: "any" },
 };
+//Permite mudança de ator mediante situação de atendimento.
+function allowedActorForTransition(order, nextStatus) {
+  if (order.status === "accepted" && nextStatus === "on_the_way") {
+    if (order.service_location === "at_provider") return "customer";
+    if (order.service_location === "at_customer") return "provider";
+    return null;
+  }
+
+  return ORDER_STATUS_TRANSITIONS[order.status]?.[nextStatus];
+}
 
 async function applyStatusTransition(transactionClient, order, nextStatus, actingUserId, actingRole) {
-  const allowedActor = ORDER_STATUS_TRANSITIONS[order.status]?.[nextStatus];
+  const allowedActor = allowedActorForTransition(order, nextStatus);
   if (!allowedActor || (allowedActor !== "any" && allowedActor !== actingRole))
     throw new ApiError(409, "invalid_transition", `Cannot change from ${order.status} to ${nextStatus}.`);
 
