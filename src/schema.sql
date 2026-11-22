@@ -326,8 +326,11 @@ CREATE TABLE IF NOT EXISTS quote_items (
   quantity numeric(10,2) NOT NULL DEFAULT 1 CHECK (quantity > 0),
   unit_price numeric(10,2) NOT NULL CHECK (unit_price >= 0),
   kind text NOT NULL DEFAULT 'service'
-    CHECK (kind IN ('service', 'travel', 'discount', 'additional'))
+    CHECK (kind IN ('service', 'travel', 'discount', 'additional')),
+  created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS quote_events (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -428,10 +431,24 @@ CREATE TABLE IF NOT EXISTS plan_purchases (
   store_product_id text NOT NULL,
   purchase_kind text NOT NULL CHECK (purchase_kind IN ('subscription','approval_pack','promotion_pack','featured')),
   quantity int NOT NULL DEFAULT 1 CHECK (quantity > 0),
+  plan_name text,
   expires_at timestamptz,
-  status text NOT NULL DEFAULT 'active',
+  status text NOT NULL DEFAULT 'pending',
+  gateway_provider text,
+  gateway_transaction_id text,
+  amount numeric(10,2),
+  currency text NOT NULL DEFAULT 'BRL',
+  paid_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE plan_purchases ADD COLUMN IF NOT EXISTS plan_name text;
+ALTER TABLE plan_purchases ADD COLUMN IF NOT EXISTS gateway_provider text;
+ALTER TABLE plan_purchases ADD COLUMN IF NOT EXISTS gateway_transaction_id text;
+ALTER TABLE plan_purchases ADD COLUMN IF NOT EXISTS amount numeric(10,2);
+ALTER TABLE plan_purchases ADD COLUMN IF NOT EXISTS currency text NOT NULL DEFAULT 'BRL';
+ALTER TABLE plan_purchases ADD COLUMN IF NOT EXISTS paid_at timestamptz;
+ALTER TABLE plan_purchases ALTER COLUMN status SET DEFAULT 'pending';
 
 CREATE TABLE IF NOT EXISTS team_members (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

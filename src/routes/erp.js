@@ -24,6 +24,38 @@ erpRouter.get("/me/plan", asyncHandler(async (request, response) => {
   });
 }));
 
+erpRouter.patch("/me/plan", asyncHandler(async (request, response) => {
+  const data = z.object({
+    plan: z.enum(["free", "standard", "pro", "premium"]),
+  }).strict().parse({
+    plan: String(request.body?.plan ?? "").trim().toLowerCase(),
+  });
+
+  const limits = {
+    free: 20,
+    standard: 40,
+    pro: 100,
+    premium: null,
+  };
+
+  // TODO(payment-gateway): The selected plan can only become effective after
+  // payment authorization in production. Until then, this route exposes the
+  // registered plan change and records its database state for development.
+  const { rows } = await runQuery(
+    `INSERT INTO provider_plans (provider_id,plan_name,monthly_approval_limit,renewal_at,updated_at)
+     VALUES ($1,$2,$3,date_trunc('month',now()) + interval '1 month',now())
+     ON CONFLICT (provider_id) DO UPDATE SET
+       plan_name=EXCLUDED.plan_name,
+       monthly_approval_limit=EXCLUDED.monthly_approval_limit,
+       renewal_at=EXCLUDED.renewal_at,
+       updated_at=now()
+     RETURNING provider_id,plan_name,monthly_approval_limit,renewal_at,updated_at`,
+    [request.user.id, data.plan, limits[data.plan]],
+  );
+
+  response.json(rows[0]);
+}));
+
 erpRouter.get("/me/notifications", asyncHandler(async (request, response) => {
   const { rows } = await runQuery(
     `SELECT id,type,title,body,read,created_at AS "createdAt"
@@ -174,11 +206,20 @@ erpRouter.post("/me/purchases", asyncHandler(async (request, response) => {
     storeProductId: z.string().trim().min(1).max(200),
     purchaseKind: z.enum(["subscription", "approval_pack", "promotion_pack", "featured"]),
     quantity: z.number().int().positive().max(1000).default(1),
-  }).strict().parse(request.body);
+    plan: z.enum(["free", "standard", "pro", "premium"]).optional(),
+  }).strict().parse({
+    ...request.body,
+    plan: request.body?.plan
+      ? String(request.body.plan).trim().toLowerCase()
+      : undefined,
+  });
   const { rows } = await runQuery(
-    `INSERT INTO plan_purchases (provider_id,store_product_id,purchase_kind,quantity,status)
-     VALUES ($1,$2,$3,$4,'active') RETURNING *`,
-    [request.user.id, data.storeProductId, data.purchaseKind, data.quantity]
+    `INSERT INTO plan_purchases
+       (provider_id,store_product_id,purchase_kind,quantity,plan_name,status)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [request.user.id, data.storeProductId, data.purchaseKind, data.quantity,
+     data.purchaseKind === "subscription" ? data.plan ?? null : null,
+     data.purchaseKind === "subscription" ? "pending" : "active"]
   );
   response.status(201).json(rows[0]);
 }));
