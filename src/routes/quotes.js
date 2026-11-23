@@ -42,6 +42,10 @@ const requestSchema = z.object({
 quotesRouter.post("/requests", requireRole("cliente"), asyncHandler(async (request, response) => {
   const data = requestSchema.parse(request.body);
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  if (data.providerId === request.user.id)
+    throw new ApiError(422, "self_dealing", "You cannot request a quote from yourself.", {
+      providerId: "Choose another provider.",
+    });
   if (data.providerId) {
     const { rows } = await runQuery(
       `SELECT 1 FROM users u JOIN provider_profiles p ON p.user_id=u.id
@@ -62,8 +66,19 @@ quotesRouter.post("/requests", requireRole("cliente"), asyncHandler(async (reque
   response.status(201).json(rows[0]);
 }));
 
+// Quem tem os dois papéis escolhe a visão com ?as=customer|provider.
+// Sem o parâmetro, mantém o comportamento antigo: prestadora vê a visão de prestadora.
+const requestListQuerySchema = z.object({ as: z.enum(["customer", "provider"]).optional() }).passthrough();
+
 quotesRouter.get("/requests", asyncHandler(async (request, response) => {
-  const isProvider = request.user.roles?.includes("prestadora");
+  const { as: requestedView } = requestListQuerySchema.parse(request.query);
+  const roles = request.user.roles ?? [];
+  const view = requestedView ?? (roles.includes("prestadora") ? "provider" : "customer");
+  if (view === "provider" && !roles.includes("prestadora"))
+    throw new ApiError(403, "forbidden", "Requires role prestadora.");
+  if (view === "customer" && !roles.includes("cliente"))
+    throw new ApiError(403, "forbidden", "Requires role cliente.");
+  const isProvider = view === "provider";
   const { rows } = await runQuery(
     `SELECT r.*,
       customer.name AS "customerName",
@@ -79,7 +94,7 @@ quotesRouter.get("/requests", asyncHandler(async (request, response) => {
      FROM service_requests r
      LEFT JOIN users customer ON customer.id=r.customer_id
      WHERE r.${isProvider ? "provider_id" : "customer_id"}=$1
-        OR ($2='provider' AND r.provider_id IS NULL)
+        OR ($2='provider' AND r.provider_id IS NULL AND r.customer_id<>$1)
      ORDER BY r.created_at DESC LIMIT 100`,
     [request.user.id, isProvider ? "provider" : "customer"]
   );
@@ -111,6 +126,8 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
       throw new ApiError(409, "invalid_transition", "Request is no longer open.");
     if (serviceRequest.provider_id && serviceRequest.provider_id !== request.user.id)
       throw new ApiError(403, "forbidden", "This request belongs to another provider.");
+    if (serviceRequest.customer_id === request.user.id)
+      throw new ApiError(403, "self_dealing", "You cannot quote your own request.");
 
     const { rows: openRows } = await transaction.query(
       "SELECT count(*)::int AS total FROM quotes WHERE request_id=$1 AND status IN ('open','countered')",

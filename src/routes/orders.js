@@ -100,6 +100,11 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
     const service = matchingServices[0];
     if (!service || service.activation_status !== "active")
       throw new ApiError(404, "not_found", "Service not available.");
+    // Conta com os dois papéis não pode contratar o próprio serviço
+    if (service.provider_id === request.user.id)
+      throw new ApiError(422, "self_dealing", "You cannot book your own service.", {
+        serviceId: "Choose a service from another provider.",
+      });
 
     // Atendimento na casa do cliente exige um endereço dele. Atendimento na prestadora não:
     // o endereço do cliente nem é gravado (a prestadora não precisa saber onde ele mora).

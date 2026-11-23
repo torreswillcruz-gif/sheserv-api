@@ -103,6 +103,54 @@ authRouter.post("/logout-all", requireAuthentication, asyncHandler(async (reques
   response.sendStatus(204);
 }));
 
+// ---------- Ativar o outro papel (cliente <-> prestadora) na mesma conta ----------
+// Uma conta pode ser cliente e prestadora. Como o accessToken carrega os papéis,
+// a resposta é uma sessão nova; o refreshToken antigo informado é revogado.
+// "admin" não pode ser obtido por aqui.
+const enableRoleSchema = z.object({
+  role: z.enum(["cliente", "prestadora"]),
+  providerProfile: z.object({ bio: z.string().trim().max(500).optional() }).strict().optional(),
+  refreshToken: z.string().min(10).optional(),
+}).strict();
+
+authRouter.post("/roles", requireAuthentication, asyncHandler(async (request, response) => {
+  const roleRequest = enableRoleSchema.parse(request.body);
+
+  const updatedUser = await runInTransaction(async (transactionClient) => {
+    const { rows: users } = await transactionClient.query(
+      "SELECT id,name,email,roles FROM users WHERE id=$1 FOR UPDATE",
+      [request.user.id]
+    );
+    const user = users[0];
+    if (!user) throw new ApiError(401, "unauthorized", "Account not found.");
+
+    let roles = user.roles;
+    if (!roles.includes(roleRequest.role)) {
+      const { rows: updatedRows } = await transactionClient.query(
+        "UPDATE users SET roles=array_append(roles,$2) WHERE id=$1 RETURNING roles",
+        [user.id, roleRequest.role]
+      );
+      roles = updatedRows[0].roles;
+    }
+    // A nova prestadora entra como "pending" e passa pela aprovação do admin
+    if (roleRequest.role === "prestadora") {
+      await transactionClient.query(
+        "INSERT INTO provider_profiles (user_id,bio) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING",
+        [user.id, roleRequest.providerProfile?.bio ?? null]
+      );
+    }
+    if (roleRequest.refreshToken) {
+      await transactionClient.query(
+        "UPDATE refresh_tokens SET revoked=true WHERE token_hash=$1 AND user_id=$2",
+        [hashWithSha256(roleRequest.refreshToken), user.id]
+      );
+    }
+    return { ...user, roles };
+  });
+
+  response.json(await createSession(updatedUser));
+}));
+
 // OTP: contrato definido, provedor de SMS ainda não escolhido
 authRouter.post("/otp/requests", (_request, _response, next) =>
   next(new ApiError(501, "not_implemented", "OTP not configured.")));
