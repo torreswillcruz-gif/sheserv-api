@@ -1,0 +1,56 @@
+# Ambiente LOCAL completo: PostgreSQL + marketplace-api + admin-api.
+# Subir:   docker compose up --build
+# Derrubar: docker compose down        (adicione -v para apagar o banco)
+#
+# Os segredos abaixo são apenas para desenvolvimento local. Em produção (AWS),
+# use Secrets Manager / SSM Parameter Store — nunca estes valores.
+x-local-secrets: &local-secrets
+  JWT_SECRET: local-dev-jwt-secret-change-me-0123456789
+  DATABASE_URL: postgres://sheserve:sheserve@db:5432/sheserve
+  DATABASE_SSL: "false"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sheserve
+      POSTGRES_PASSWORD: sheserve
+      POSTGRES_DB: sheserve
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sheserve -d sheserve"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    init: true # repassa SIGTERM ao Node para o container parar rápido
+    environment:
+      <<: *local-secrets
+      DATA_ENCRYPTION_KEY: local-dev-encryption-key-change-me-0123456
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  admin-api:
+    build: ./admin-api
+    init: true
+    environment:
+      <<: *local-secrets
+      PORT: "3001"
+    ports:
+      - "3001:3001"
+    depends_on:
+      # a admin-api depende das tabelas criadas pela migração da api principal
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
