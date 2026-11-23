@@ -17,3 +17,18 @@ services:
         generateValue: true
       - key: COMMISSION_RATE
         value: "0.12"
+  - type: web
+    name: sheserve-admin-api
+    runtime: node
+    rootDir: ./admin-api
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL
+        value: "true"
+      - key: JWT_SECRET
+        sync: false

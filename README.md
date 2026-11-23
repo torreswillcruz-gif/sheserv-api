@@ -9,8 +9,16 @@
 1. Suba para o GitHub.
 2. Render > New + > Blueprint > selecione o repositório (usa o render.yaml).
 3. Quando pedir DATABASE_URL, cole a string do seu banco (AWS RDS). Nunca commite essa string.
-4. No AWS: instância com acesso público e Security Group liberando a porta 5432 para os IPs de saída do Render.
-5. As tabelas são criadas automaticamente na primeira inicialização.
+4. Configure `DATABASE_URL` e `JWT_SECRET` do `sheserve-admin-api` com os mesmos valores usados pelo `marketplace-api`.
+5. No AWS: instância com acesso público e Security Group liberando a porta 5432 para os IPs de saída do Render.
+6. Implante o `marketplace-api` primeiro; o serviço admin depende do esquema principal do banco.
+
+## API administrativa
+
+O serviço separado `admin-api/` compartilha o banco e os tokens JWT do
+`marketplace-api`. Consulte [admin-api/README.md](./admin-api/README.md) para
+provisionar o papel administrativo e os endpoints de aprovação, planos e auditoria.
+O cadastro público não pode criar administradores.
 
 ## Pendências (marcadas como TODO no código)
 - Gateway de pagamento (Pix/cartão)
@@ -18,7 +26,7 @@
 - Provedor de verificação de identidade + upload com URL assinada
 - Notificação de SOS
 - Filtro por distância (falta área de atendimento no ERD)
-- Ativação de prestadoras (activation_status) é feita pelo backoffice
+- Aprovação de prestadoras é feita pela API administrativa
 
 ## Solicitações e orçamentos
 - `POST /api/v1/requests` cria uma solicitação.
@@ -30,6 +38,12 @@
 - `POST /api/v1/quotes/{id}/reject` recusa uma proposta.
 - Mini-ERP: `/api/v1/me/plan`, `/financial`, `/clients`, `/stats`, `/promotions`,
   `/purchases`, `/team` e `/notifications`.
+- O painel financeiro é servido por `/api/v1/me/financial/dashboard?period=week|month|year`;
+  o fluxo de caixa agrega dias, semanas do mês ou meses do ano.
+- Ao concluir um atendimento, a API cria uma única movimentação "A receber" ligada ao pedido.
+  Ela permanece como recebível enquanto o repasse estiver pendente.
+- `/api/v1/me/stats` inclui atendimentos e clientes atendidos, valores concluídos e série
+  mensal de atendimentos, clientes, receitas e despesas.
 - O pagamento externo continua dependente de gateway aprovado e conta da loja.
 - Máximo de 3 orçamentos abertos por solicitação.
 - Limites mensais: Gratuito 20; Standard 40; Pro 100; Premium ilimitado.
