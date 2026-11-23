@@ -63,4 +63,7 @@ async function startServer() {
   return { call, close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
-module.exports = { resetDatabase, queriesMatching, startServer };
+// Regra para simular prestadora aprovada pelo admin (activation_status = 'active')
+const approvedProviderRule = { pattern: /activation_status='active'/, rows: [{ approved: 1 }] };
+
+module.exports = { resetDatabase, queriesMatching, startServer, approvedProviderRule };

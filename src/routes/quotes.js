@@ -15,6 +15,16 @@ const currentQuotaPeriod = () => new Date().toISOString().slice(0, 7);
 // quota_period usam o mês atual).
 const quotaPeriodOf = (quote) => quote.quota_period ?? currentQuotaPeriod();
 
+// Só prestadora aprovada pelo admin (activation_status = 'active') participa de
+// orçamentos: vê solicitações públicas, recebe pedidos e envia propostas.
+async function isApprovedProvider(databaseClient, providerId) {
+  const { rows } = await databaseClient.query(
+    "SELECT 1 FROM provider_profiles WHERE user_id=$1 AND activation_status='active'",
+    [providerId]
+  );
+  return Boolean(rows[0]);
+}
+
 // Devolve a unidade de cota reservada por um orçamento que não será aprovado
 async function releaseReservedQuota(transaction, quote) {
   if (!quote.reserved_quota) return;
@@ -49,7 +59,7 @@ quotesRouter.post("/requests", requireRole("cliente"), asyncHandler(async (reque
   if (data.providerId) {
     const { rows } = await runQuery(
       `SELECT 1 FROM users u JOIN provider_profiles p ON p.user_id=u.id
-       WHERE u.id=$1 AND 'prestadora'=ANY(u.roles)`,
+       WHERE u.id=$1 AND 'prestadora'=ANY(u.roles) AND p.activation_status='active'`,
       [data.providerId]
     );
     if (!rows[0]) throw new ApiError(404, "not_found", "Provider not found.");
@@ -79,6 +89,9 @@ quotesRouter.get("/requests", asyncHandler(async (request, response) => {
   if (view === "customer" && !roles.includes("cliente"))
     throw new ApiError(403, "forbidden", "Requires role cliente.");
   const isProvider = view === "provider";
+  // Cadastro em análise ou recusado ainda não recebe solicitações
+  if (isProvider && !(await isApprovedProvider({ query: runQuery }, request.user.id)))
+    return response.json([]);
   const { rows } = await runQuery(
     `SELECT r.*,
       customer.name AS "customerName",
@@ -119,6 +132,8 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
   if (new Date(data.validUntil) <= new Date())
     throw new ApiError(422, "validation_error", "Validity must be in the future.", { validUntil: "Invalid validity." });
   const created = await runInTransaction(async (transaction) => {
+    if (!(await isApprovedProvider(transaction, request.user.id)))
+      throw new ApiError(403, "provider_not_approved", "Your provider profile is awaiting approval.");
     const { rows } = await transaction.query("SELECT * FROM service_requests WHERE id=$1 FOR UPDATE", [request.params.id]);
     const serviceRequest = rows[0];
     if (!serviceRequest) throw new ApiError(404, "not_found", "Request not found.");

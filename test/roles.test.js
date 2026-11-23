@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { after, before, beforeEach, describe, test } = require("node:test");
 const jsonWebToken = require("jsonwebtoken");
-const { resetDatabase, queriesMatching, startServer } = require("./helpers/testApp");
+const { resetDatabase, queriesMatching, startServer, approvedProviderRule } = require("./helpers/testApp");
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_USER_ID = "22222222-2222-4222-8222-222222222222";
@@ -82,7 +82,7 @@ describe("POST /auth/roles", () => {
 });
 
 describe("GET /requests view", () => {
-  beforeEach(() => resetDatabase());
+  beforeEach(() => resetDatabase([approvedProviderRule]));
 
   const listRequests = (user, view) =>
     server.call("GET", `/api/v1/requests${view ? `?as=${view}` : ""}`, user);
@@ -109,6 +109,48 @@ describe("GET /requests view", () => {
   test("refuses a view for a role the account does not have", async () => {
     assert.equal((await listRequests(customerOnly, "provider")).status, 403);
     assert.equal((await listRequests(providerOnly, "customer")).status, 403);
+  });
+});
+
+describe("provider awaiting approval", () => {
+  // Sem approvedProviderRule o banco falso responde que o perfil não está "active"
+  beforeEach(() => resetDatabase([
+    { pattern: /^SELECT \* FROM service_requests WHERE id=\$1 FOR UPDATE/, rows: [{
+      id: REQUEST_ID, status: "open", provider_id: null, customer_id: OTHER_USER_ID,
+    }] },
+  ]));
+
+  test("sees no requests in the provider queue", async () => {
+    const response = await server.call("GET", "/api/v1/requests?as=provider", bothRoles);
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, []);
+    assert.equal(queriesMatching(/FROM service_requests r/).length, 0);
+  });
+
+  test("cannot send quotes", async () => {
+    const response = await server.call("POST", `/api/v1/requests/${REQUEST_ID}/quotes`, {
+      ...bothRoles,
+      body: { totalAmount: 100, validUntil: inDays(3), items: [{ description: "Serviço", unitPrice: 100 }] },
+    });
+    assert.equal(response.status, 403);
+    assert.equal(response.body.error.code, "provider_not_approved");
+    assert.equal(queriesMatching(/^INSERT INTO quotes/).length, 0);
+    assert.equal(queriesMatching(/monthly_approval_usage/).length, 0);
+  });
+
+  test("cannot receive a direct quote request", async () => {
+    const response = await server.call("POST", "/api/v1/requests", {
+      ...customerOnly,
+      body: { providerId: OTHER_USER_ID, description: "Preciso de uma manicure em casa" },
+    });
+    assert.equal(response.status, 404);
+    assert.equal(queriesMatching(/^INSERT INTO service_requests/).length, 0);
+  });
+
+  test("still uses the customer view normally", async () => {
+    const response = await server.call("GET", "/api/v1/requests?as=customer", bothRoles);
+    assert.equal(response.status, 200);
+    assert.equal(queriesMatching(/FROM service_requests r/).length, 1);
   });
 });
 
@@ -141,6 +183,7 @@ describe("self-dealing is blocked", () => {
 
   test("quoting your own request", async () => {
     resetDatabase([
+      approvedProviderRule,
       { pattern: /^SELECT \* FROM service_requests WHERE id=\$1 FOR UPDATE/, rows: [{
         id: REQUEST_ID, status: "open", provider_id: null, customer_id: USER_ID,
       }] },
@@ -156,6 +199,7 @@ describe("self-dealing is blocked", () => {
 
   test("another provider can still quote the request", async () => {
     resetDatabase([
+      approvedProviderRule,
       { pattern: /^SELECT \* FROM service_requests WHERE id=\$1 FOR UPDATE/, rows: [{
         id: REQUEST_ID, status: "open", provider_id: null, customer_id: OTHER_USER_ID,
       }] },

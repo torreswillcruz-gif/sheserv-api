@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { after, before, beforeEach, describe, test } = require("node:test");
-const { resetDatabase, queriesMatching, startServer } = require("./helpers/testApp");
+const { resetDatabase, queriesMatching, startServer, approvedProviderRule } = require("./helpers/testApp");
 
 const CUSTOMER_ID = "11111111-1111-4111-8111-111111111111";
 const PROVIDER_ID = "22222222-2222-4222-8222-222222222222";
@@ -166,6 +166,7 @@ describe("POST /requests/:id/quotes", () => {
   beforeEach(() => {
     usage = { approved_count: 0, reserved_count: 0 };
     resetDatabase([
+      approvedProviderRule,
       { pattern: /^SELECT \* FROM service_requests WHERE id=\$1 FOR UPDATE/, rows: [{ id: REQUEST_ID, status: "open", provider_id: null, customer_id: CUSTOMER_ID }] },
       { pattern: /^SELECT count\(\*\)::int AS total FROM quotes/, rows: [{ total: 0 }] },
       { pattern: /^SELECT monthly_approval_limit FROM plan_catalog/, rows: [{ monthly_approval_limit: 20 }] },
