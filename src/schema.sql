@@ -370,6 +370,9 @@ CREATE TABLE IF NOT EXISTS quote_items (
 
 ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
 
+-- mês (YYYY-MM) em que a cota do orçamento foi reservada; usado para devolver/aprovar no mesmo período
+ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quota_period text;
+
 CREATE TABLE IF NOT EXISTS quote_events (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   quote_id uuid NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,

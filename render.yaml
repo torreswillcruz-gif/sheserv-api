@@ -15,8 +15,6 @@ services:
         generateValue: true
       - key: DATA_ENCRYPTION_KEY
         generateValue: true
-      - key: COMMISSION_RATE
-        value: "0.12"
   - type: web
     name: sheserve-admin-api
     runtime: node

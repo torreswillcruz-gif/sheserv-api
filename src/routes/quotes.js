@@ -5,6 +5,28 @@ const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
 const { requireRole } = require("../security");
 
+// Orçamentos que ainda podem ser aprovados, recusados ou negociados
+const NEGOTIABLE_QUOTE_STATUSES = ["open", "countered"];
+
+// Mês (UTC) em que a cota é reservada, no formato YYYY-MM
+const currentQuotaPeriod = () => new Date().toISOString().slice(0, 7);
+
+// A cota é devolvida no mesmo mês em que foi reservada (orçamentos antigos sem
+// quota_period usam o mês atual).
+const quotaPeriodOf = (quote) => quote.quota_period ?? currentQuotaPeriod();
+
+// Devolve a unidade de cota reservada por um orçamento que não será aprovado
+async function releaseReservedQuota(transaction, quote) {
+  if (!quote.reserved_quota) return;
+  await transaction.query(
+    `UPDATE monthly_approval_usage
+     SET reserved_count=GREATEST(reserved_count-1,0)
+     WHERE provider_id=$1 AND period=$2`,
+    [quote.provider_id, quotaPeriodOf(quote)]
+  );
+  await transaction.query("UPDATE quotes SET reserved_quota=false WHERE id=$1", [quote.id]);
+}
+
 const requestSchema = z.object({
   providerId: z.string().uuid().optional(),
   serviceId: z.string().uuid().optional(),
@@ -103,7 +125,7 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
     if (providerRows[0])
       throw new ApiError(409, "duplicate_quote", "You already sent an open quote for this request.");
 
-    const period = new Date().toISOString().slice(0, 7);
+    const period = currentQuotaPeriod();
     const { rows: planRows } = await transaction.query(
       `SELECT monthly_approval_limit FROM plan_catalog
        WHERE plan_code=COALESCE(
@@ -127,10 +149,10 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
       [request.user.id, period]
     );
     const { rows: quoteRows } = await transaction.query(
-      `INSERT INTO quotes (request_id,provider_id,customer_id,status,total_amount,valid_until,terms,reserved_quota)
-       VALUES ($1,$2,$3,'open',$4,$5,$6,true) RETURNING *`,
+      `INSERT INTO quotes (request_id,provider_id,customer_id,status,total_amount,valid_until,terms,reserved_quota,quota_period)
+       VALUES ($1,$2,$3,'open',$4,$5,$6,true,$7) RETURNING *`,
       [serviceRequest.id, request.user.id, serviceRequest.customer_id, data.totalAmount,
-       data.validUntil, data.terms ?? null]
+       data.validUntil, data.terms ?? null, period]
     );
     const quote = quoteRows[0];
     for (const item of data.items) {
@@ -169,7 +191,7 @@ quotesRouter.post("/quotes/:id/approve", requireRole("cliente"), asyncHandler(as
     const quote = rows[0];
     if (!quote) throw new ApiError(404, "not_found", "Quote not found.");
     if (quote.customer_id !== request.user.id) throw new ApiError(403, "forbidden", "Not your quote.");
-    if (quote.status !== "open" || new Date(quote.valid_until) <= new Date())
+    if (!NEGOTIABLE_QUOTE_STATUSES.includes(quote.status) || new Date(quote.valid_until) <= new Date())
       throw new ApiError(409, "invalid_transition", "Quote is not available for approval.");
 
     const { rows: requestRows } = await transaction.query(
@@ -236,22 +258,40 @@ quotesRouter.post("/quotes/:id/approve", requireRole("cliente"), asyncHandler(as
       [orderId, request.user.id, { quoteId: quote.id }]
     );
 
-    await transaction.query("UPDATE quotes SET status='approved',updated_at=now() WHERE id=$1", [quote.id]);
     await transaction.query(
-      "UPDATE quotes SET status='rejected',updated_at=now() WHERE request_id=$1 AND id<>$2 AND status='open'",
-      [quote.request_id, quote.id]
+      "UPDATE quotes SET status='approved',reserved_quota=false,updated_at=now() WHERE id=$1",
+      [quote.id]
     );
+
+    // As demais propostas em negociação são encerradas e devolvem a cota de cada prestadora
+    const { rows: competingQuotes } = await transaction.query(
+      `SELECT * FROM quotes
+       WHERE request_id=$1 AND id<>$2 AND status = ANY($3::text[])
+       FOR UPDATE`,
+      [quote.request_id, quote.id, NEGOTIABLE_QUOTE_STATUSES]
+    );
+    for (const competingQuote of competingQuotes) {
+      await transaction.query(
+        "UPDATE quotes SET status='rejected',updated_at=now() WHERE id=$1",
+        [competingQuote.id]
+      );
+      await releaseReservedQuota(transaction, competingQuote);
+    }
+
     await transaction.query(
       "UPDATE service_requests SET status='accepted',provider_id=$2,updated_at=now() WHERE id=$1",
       [quote.request_id, quote.provider_id]
     );
-    const period = new Date().toISOString().slice(0, 7);
-    await transaction.query(
-      `UPDATE monthly_approval_usage
-       SET approved_count=approved_count+1,reserved_count=GREATEST(reserved_count-1,0)
-       WHERE provider_id=$1 AND period=$2`,
-      [quote.provider_id, period]
-    );
+
+    // A reserva vira aprovação no mesmo mês em que a cota foi reservada
+    if (quote.reserved_quota) {
+      await transaction.query(
+        `UPDATE monthly_approval_usage
+         SET approved_count=approved_count+1,reserved_count=GREATEST(reserved_count-1,0)
+         WHERE provider_id=$1 AND period=$2`,
+        [quote.provider_id, quotaPeriodOf(quote)]
+      );
+    }
     return { id: orderId };
   });
   const { rows } = await runQuery("SELECT * FROM quotes WHERE id=$1", [request.params.id]);
@@ -365,26 +405,19 @@ quotesRouter.post("/quotes/:id/counter", asyncHandler(async (request, response) 
 }));
 
 quotesRouter.post("/quotes/:id/reject", requireRole("cliente"), asyncHandler(async (request, response) => {
-  const { rows } = await runQuery("SELECT * FROM quotes WHERE id=$1", [request.params.id]);
-  const quote = rows[0];
-  if (!quote) throw new ApiError(404, "not_found", "Quote not found.");
-  if (quote.customer_id !== request.user.id) throw new ApiError(403, "forbidden", "Not your quote.");
-  if (!["open", "countered"].includes(quote.status))
-    throw new ApiError(409, "invalid_transition", "Quote is no longer open.");
-  const update = await runInTransaction(async (transaction) => {
+  const rejectedQuoteId = await runInTransaction(async (transaction) => {
+    const { rows } = await transaction.query("SELECT * FROM quotes WHERE id=$1 FOR UPDATE", [request.params.id]);
+    const quote = rows[0];
+    if (!quote) throw new ApiError(404, "not_found", "Quote not found.");
+    if (quote.customer_id !== request.user.id) throw new ApiError(403, "forbidden", "Not your quote.");
+    if (!NEGOTIABLE_QUOTE_STATUSES.includes(quote.status))
+      throw new ApiError(409, "invalid_transition", "Quote is no longer open.");
+
     await transaction.query("UPDATE quotes SET status='rejected',updated_at=now() WHERE id=$1", [quote.id]);
-    if (quote.reserved_quota) {
-      const period = new Date().toISOString().slice(0, 7);
-      await transaction.query(
-        `UPDATE monthly_approval_usage
-         SET reserved_count=GREATEST(reserved_count-1,0)
-         WHERE provider_id=$1 AND period=$2`,
-        [quote.provider_id, period]
-      );
-      await transaction.query("UPDATE quotes SET reserved_quota=false WHERE id=$1", [quote.id]);
-    }
+    await releaseReservedQuota(transaction, quote);
+    return quote.id;
   });
-  response.json({ id: quote.id, status: "rejected" });
+  response.json({ id: rejectedQuoteId, status: "rejected" });
 }));
 
 module.exports = { quotesRouter };
