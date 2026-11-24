@@ -196,3 +196,43 @@ describe("agenda per area", () => {
     assert.match(queriesMatching(/FROM orders/)[0].sql, /WHERE provider_id = \$1 AND status = ANY/);
   });
 });
+
+describe("GET /quotes/:id/slots", () => {
+  const QUOTE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const quoteRow = (overrides = {}) => ({
+    customer_id: CUSTOMER_ID, provider_id: PROVIDER_ID, duration_minutes: 60, availability: WEEKDAY_HOURS,
+    ...overrides,
+  });
+
+  test("uses the request's service hours and marks busy times", async () => {
+    resetDatabase([
+      { pattern: /^SELECT quote\.customer_id/, rows: [quoteRow()] },
+      { pattern: /^SELECT scheduled_at, duration_minutes, provider_id, customer_id FROM orders/, rows: [
+        { scheduled_at: atBrasilia(10), duration_minutes: 60, provider_id: PROVIDER_ID, customer_id: "x" },
+      ] },
+    ]);
+    const response = await server.call("GET", `/api/v1/quotes/${QUOTE_ID}/slots?date=${WEDNESDAY}`, customer);
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.availability, WEEKDAY_HOURS);
+    const byTime = Object.fromEntries(response.body.slots.map((slot) => [slot.time, slot]));
+    assert.deepEqual(Object.keys(byTime), ["09:00", "09:30", "10:00", "10:30", "11:00"]);
+    assert.equal(byTime["09:00"].available, true);
+    assert.equal(byTime["10:00"].reason, "provider_busy");
+  });
+
+  test("a request without a service gets the default 08:00–20:00 range", async () => {
+    resetDatabase([{ pattern: /^SELECT quote\.customer_id/, rows: [quoteRow({ duration_minutes: null, availability: null })] }]);
+    const response = await server.call("GET", `/api/v1/quotes/${QUOTE_ID}/slots?date=${WEDNESDAY}`, customer);
+    assert.equal(response.status, 200);
+    assert.equal(response.body.durationMinutes, 60);
+    assert.deepEqual(response.body.hours, [{ start: "08:00", end: "20:00" }]);
+    assert.equal(response.body.slots[0].time, "08:00");
+    assert.equal(response.body.slots.at(-1).time, "19:00");
+  });
+
+  test("only the customer of the quote can see the slots", async () => {
+    resetDatabase([{ pattern: /^SELECT quote\.customer_id/, rows: [quoteRow({ customer_id: "someone-else" })] }]);
+    const response = await server.call("GET", `/api/v1/quotes/${QUOTE_ID}/slots?date=${WEDNESDAY}`, customer);
+    assert.equal(response.status, 403);
+  });
+});

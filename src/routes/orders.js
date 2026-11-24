@@ -239,6 +239,7 @@ ordersRouter.get("/services/:id/slots", asyncHandler(async (request, response) =
   response.json({
     date,
     durationMinutes: service.duration_minutes,
+    availability: service.availability ?? [],
     hours: windows.map(({ start, end }) => ({ start, end })),
     slots,
   });

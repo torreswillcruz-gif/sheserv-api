@@ -4,7 +4,8 @@ const { z } = require("zod");
 const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
 const { requireRole } = require("../security");
-const { assertSlotFree } = require("../schedule");
+const { assertBookableDate, assertSlotFree, slotsForDay } = require("../schedule");
+const { isValidUuid } = require("../validation");
 
 // Orçamentos que ainda podem ser aprovados, recusados ou negociados
 const NEGOTIABLE_QUOTE_STATUSES = ["open", "countered"];
@@ -206,6 +207,43 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
     return quote;
   });
   response.status(201).json(created);
+}));
+
+// Horários para aprovar um orçamento num dia (horário de Brasília). Usa o horário
+// de atendimento e a duração do serviço da solicitação; sem serviço, a faixa
+// padrão de 08:00 às 20:00 e 60 minutos. Marca os horários em que a prestadora
+// ou a própria cliente já têm compromisso, como em GET /services/:id/slots.
+quotesRouter.get("/quotes/:id/slots", requireRole("cliente"), asyncHandler(async (request, response) => {
+  if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Quote not found.");
+  const { date } = z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict().parse(request.query);
+  assertBookableDate(date);
+
+  const { rows } = await runQuery(
+    `SELECT quote.customer_id, quote.provider_id, service.duration_minutes, service.availability
+     FROM quotes quote
+     JOIN service_requests service_request ON service_request.id = quote.request_id
+     LEFT JOIN services service ON service.id = service_request.service_id
+       AND service.provider_id = quote.provider_id AND service.active
+     WHERE quote.id = $1`,
+    [request.params.id]
+  );
+  const quote = rows[0];
+  if (!quote) throw new ApiError(404, "not_found", "Quote not found.");
+  if (quote.customer_id !== request.user.id) throw new ApiError(403, "forbidden", "Not your quote.");
+
+  const service = {
+    provider_id: quote.provider_id,
+    duration_minutes: quote.duration_minutes ?? 60,
+    availability: quote.availability ?? [],
+  };
+  const { windows, slots } = await slotsForDay({ query: runQuery }, { service, dateKey: date, customerId: request.user.id });
+  response.json({
+    date,
+    durationMinutes: service.duration_minutes,
+    availability: service.availability,
+    hours: windows.map(({ start, end }) => ({ start, end })),
+    slots,
+  });
 }));
 
 quotesRouter.post("/quotes/:id/approve", requireRole("cliente"), asyncHandler(async (request, response) => {
