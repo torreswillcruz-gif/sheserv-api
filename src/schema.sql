@@ -513,3 +513,13 @@ CREATE TABLE IF NOT EXISTS team_members (
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_financial_provider ON financial_entries(provider_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_provider_clients ON provider_clients(provider_id);
+
+-- Revisão manual das verificações de identidade pelo admin
+ALTER TABLE verifications ADD COLUMN IF NOT EXISTS review_note text;
+ALTER TABLE verifications ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE verifications ADD COLUMN IF NOT EXISTS reviewed_by uuid REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_verifications_result ON verifications(result, created_at);
+
+-- Aprovar a prestadora é a verificação dela: quem já estava aprovada passa a
+-- constar como verificada (o catálogo do app só mostra aprovadas e verificadas).
+UPDATE provider_profiles SET verified=true WHERE activation_status='active' AND verified=false;

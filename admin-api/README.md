@@ -65,10 +65,22 @@ currently active `admin` role. Responses use JSON and the standard API error
 shape.
 
 - `GET /api/v1/admin/providers?status=pending&limit=50&offset=0`
+  - Each item includes the active services and the current plan.
 - `PATCH /api/v1/admin/providers/{providerId}/approval`
   - Body: `{"status":"active"}` or
     `{"status":"rejected","reason":"Reason for rejection"}`
-  - Approval does not modify identity verification.
+  - Approving a provider is her verification: it sets `verified = true`
+    (required to appear in the app search) and resolves her pending
+    verification requests. Rejecting sets `verified = false`.
+- `GET /api/v1/admin/verifications?result=pending&limit=50&offset=0`
+  - Identity verification requests (`pending`, `approved`, `rejected`) with the
+    requester's contact details and roles.
+- `PATCH /api/v1/admin/verifications/{verificationId}`
+  - Body: `{"result":"approved"}` or
+    `{"result":"rejected","reason":"Reason for rejection"}`
+  - Manual review (identity confirmed outside the app). Approving also sets the
+    provider `verified` mark; it does not change the provider approval. The
+    user is notified and sees the reason in the app.
 - `GET /api/v1/admin/plans`
 - `PUT /api/v1/admin/plans/{planCode}`
   - `planCode` is `free`, `standard`, `pro`, or `premium`.

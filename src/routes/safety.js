@@ -17,7 +17,8 @@ const locationSchema = z.object({
 
 safetyRouter.get("/me/verifications", asyncHandler(async (request, response) => {
   const { rows: verifications } = await runQuery(
-    `SELECT id, type, provider, result, score::float, expires_at AS "expiresAt"
+    `SELECT id, type, provider, result, score::float, expires_at AS "expiresAt",
+       review_note AS "reviewNote", reviewed_at AS "reviewedAt", created_at AS "createdAt"
      FROM verifications WHERE user_id=$1 ORDER BY created_at DESC`,
     [request.user.id]
   );

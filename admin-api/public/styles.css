@@ -126,7 +126,24 @@ textarea { resize: vertical; }
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
 }
-.topbar-user { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.topbar { flex-wrap: wrap; }
+.sections { display: flex; gap: 4px; flex-wrap: wrap; order: 2; }
+.section-link {
+  border: 0;
+  border-radius: 10px;
+  padding: 8px 14px;
+  background: transparent;
+  color: var(--wine);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.section-link:hover { background: var(--blush); }
+.section-link[aria-current="page"] { background: var(--blush); color: var(--primary); }
+.topbar-user { display: flex; align-items: center; gap: 12px; min-width: 0; order: 3; }
+@media (max-width: 720px) {
+  .sections { order: 4; width: 100%; }
+}
 .topbar-user span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .content { max-width: 1040px; margin: 0 auto; padding: 28px 16px 48px; }
@@ -153,10 +170,10 @@ textarea { resize: vertical; }
 }
 .tab[aria-pressed="true"] { background: var(--wine); border-color: var(--wine); color: #fff; }
 
-#list-status { margin-bottom: 12px; min-height: 1.5em; }
+.list-status { margin-bottom: 12px; min-height: 1.5em; }
 
 /* Cartões */
-.provider-list { display: grid; gap: 16px; }
+.item-list { display: grid; gap: 16px; }
 .card {
   display: grid;
   gap: 16px;
@@ -176,9 +193,40 @@ textarea { resize: vertical; }
   font-size: 0.78rem;
   font-weight: 700;
 }
+.badges { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .badge.pending { background: var(--warning-bg); color: var(--warning); }
-.badge.active { background: var(--success-bg); color: var(--success); }
+.badge.active, .badge.approved { background: var(--success-bg); color: var(--success); }
 .badge.rejected { background: var(--error-bg); color: var(--error); }
+.badge.neutral { background: var(--blush); color: var(--wine); }
+
+.review-note {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--background);
+  font-size: 0.9rem;
+}
+
+/* Planos */
+.plan-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.plan-card { align-content: start; }
+.plan-features {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.plan-features legend { padding: 0 6px; font-weight: 600; font-size: 0.9rem; color: var(--wine); }
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  color: var(--text);
+}
+label.check input { width: 18px; height: 18px; accent-color: var(--primary); }
+.hint { font-weight: 400; font-size: 0.8rem; color: var(--muted); }
 
 .card-contact {
   display: grid;

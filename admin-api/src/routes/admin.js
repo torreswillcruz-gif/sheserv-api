@@ -59,6 +59,8 @@ adminRouter.get("/providers", asyncHandler(async (request, response) => {
        provider_user.created_at AS "createdAt",provider_profile.bio,
        provider_profile.activation_status AS "activationStatus",
        provider_profile.verified AS "identityVerified",
+       COALESCE(provider_plan.plan_name,'free') AS "planCode",
+       COALESCE(plan.display_name,'Grátis') AS "planName",
        COALESCE((
          SELECT json_agg(json_build_object(
            'title',offered.title,
@@ -73,6 +75,8 @@ adminRouter.get("/providers", asyncHandler(async (request, response) => {
        ),'[]'::json) AS services
      FROM provider_profiles provider_profile
      JOIN users provider_user ON provider_user.id=provider_profile.user_id
+     LEFT JOIN provider_plans provider_plan ON provider_plan.provider_id=provider_user.id
+     LEFT JOIN plan_catalog plan ON plan.plan_code=COALESCE(provider_plan.plan_name,'free')
      WHERE provider_user.roles @> ARRAY['prestadora']::text[]
        AND ($1::text IS NULL OR provider_profile.activation_status=$1)
      ORDER BY CASE provider_profile.activation_status WHEN 'pending' THEN 0 ELSE 1 END,
@@ -99,12 +103,28 @@ adminRouter.patch("/providers/:id/approval", asyncHandler(async (request, respon
     if (!providers[0]) throw new ApiError(404, "not_found", "Provider not found.");
 
     const previousStatus = providers[0].status;
+    // A aprovação da prestadora é a verificação dela: aprovar marca como
+    // verificada (requisito para aparecer na busca do app); recusar desmarca.
     const { rows: updatedProviders } = await transaction.query(
       `UPDATE provider_profiles
-       SET activation_status=$1,available=CASE WHEN $1='rejected' THEN false ELSE available END
+       SET activation_status=$1,
+           verified=($1='active'),
+           available=CASE WHEN $1='rejected' THEN false ELSE available END
        WHERE user_id=$2
        RETURNING user_id AS id,activation_status AS "activationStatus",verified AS "identityVerified"`,
       [change.status, request.params.id]
+    );
+    // Pedidos de verificação ainda abertos são resolvidos junto com o cadastro
+    await transaction.query(
+      `UPDATE verifications
+       SET result=$2,review_note=$3,reviewed_at=now(),reviewed_by=$4
+       WHERE user_id=$1 AND result='pending'`,
+      [
+        request.params.id,
+        change.status === "active" ? "approved" : "rejected",
+        change.status === "active" ? "Verificada na aprovação do cadastro de prestadora." : change.reason,
+        request.user.id,
+      ]
     );
     const notification = change.status === "active"
       ? ["Cadastro aprovado", "Seu cadastro como prestadora foi aprovado."]
@@ -123,6 +143,88 @@ adminRouter.patch("/providers/:id/approval", asyncHandler(async (request, respon
 
   response.json(result);
 }));
+
+// ---------- Verificações de identidade (revisão manual) ----------
+
+const VERIFICATION_RESULTS = ["pending", "approved", "rejected"];
+
+const verificationListSchema = z.object({
+  result: z.enum(VERIFICATION_RESULTS).default("pending"),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  offset: z.coerce.number().int().min(0).max(10000).default(0),
+}).strict();
+
+const verificationReviewSchema = z.object({
+  result: z.enum(["approved", "rejected"]),
+  reason: z.string().trim().min(1).max(500).optional(),
+}).strict().refine(
+  (review) => review.result !== "rejected" || Boolean(review.reason),
+  { message: "A reason is required when rejecting a verification.", path: ["reason"] }
+);
+
+adminRouter.get("/verifications", asyncHandler(async (request, response) => {
+  const filters = verificationListSchema.parse(request.query);
+  const { rows } = await runQuery(
+    `SELECT verification.id,verification.type,verification.result,
+       verification.review_note AS "reviewNote",verification.reviewed_at AS "reviewedAt",
+       verification.created_at AS "createdAt",
+       requester.id AS "userId",requester.name,requester.email,requester.phone,requester.roles,
+       provider_profile.activation_status AS "providerStatus"
+     FROM verifications verification
+     JOIN users requester ON requester.id=verification.user_id
+     LEFT JOIN provider_profiles provider_profile ON provider_profile.user_id=requester.id
+     WHERE verification.result=$1
+     ORDER BY verification.created_at ${filters.result === "pending" ? "ASC" : "DESC"}
+     LIMIT $2 OFFSET $3`,
+    [filters.result, filters.limit, filters.offset]
+  );
+  response.json({ items: rows, limit: filters.limit, offset: filters.offset });
+}));
+
+adminRouter.patch("/verifications/:id", asyncHandler(async (request, response) => {
+  validateUuid(request.params.id, "Verification not found.");
+  const review = verificationReviewSchema.parse(request.body);
+
+  const result = await runInTransaction(async (transaction) => {
+    const { rows: verifications } = await transaction.query(
+      "SELECT id,user_id,type,result FROM verifications WHERE id=$1 FOR UPDATE",
+      [request.params.id]
+    );
+    const verification = verifications[0];
+    if (!verification) throw new ApiError(404, "not_found", "Verification not found.");
+
+    const { rows: updated } = await transaction.query(
+      `UPDATE verifications SET result=$2,review_note=$3,reviewed_at=now(),reviewed_by=$4
+       WHERE id=$1
+       RETURNING id,type,result,review_note AS "reviewNote",reviewed_at AS "reviewedAt"`,
+      [verification.id, review.result, review.reason ?? null, request.user.id]
+    );
+    // Identidade confirmada também vale como selo de verificada da prestadora.
+    // Não muda a aprovação do cadastro (activation_status).
+    if (review.result === "approved") {
+      await transaction.query("UPDATE provider_profiles SET verified=true WHERE user_id=$1", [verification.user_id]);
+    }
+    const notification = review.result === "approved"
+      ? ["Identidade verificada", "Sua verificação de identidade foi aprovada."]
+      : ["Verificação não aprovada", `Sua verificação de identidade não foi aprovada. Motivo: ${review.reason}`];
+    await transaction.query(
+      "INSERT INTO notifications (user_id,type,title,body) VALUES ($1,$2,$3,$4)",
+      [verification.user_id, `verification_${review.result}`, notification[0], notification[1]]
+    );
+    await recordAudit(transaction, request.user.id, "verification.reviewed", "verification", verification.id, {
+      userId: verification.user_id,
+      type: verification.type,
+      previousResult: verification.result,
+      result: review.result,
+      reason: review.reason ?? null,
+    });
+    return updated[0];
+  });
+
+  response.json(result);
+}));
+
+// ---------- Planos ----------
 
 adminRouter.get("/plans", asyncHandler(async (_request, response) => {
   const { rows } = await runQuery(

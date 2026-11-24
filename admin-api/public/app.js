@@ -1,4 +1,4 @@
-// Painel de aprovação de prestadoras (SheServe Admin).
+// Painel administrativo SheServe: prestadoras, verificações e planos.
 // Fala só com a própria admin-api (mesma origem). Todo dado vindo da API é
 // inserido com textContent, nunca como HTML.
 (() => {
@@ -7,47 +7,53 @@
   const SESSION_KEY = "sheserve-admin-session";
   const PAGE_SIZE = 50;
 
-  const STATUS_LABELS = { pending: "Pendente", active: "Aprovada", rejected: "Recusada" };
-  const EMPTY_MESSAGES = {
-    pending: "Nenhuma prestadora aguardando aprovação.",
-    active: "Nenhuma prestadora aprovada ainda.",
-    rejected: "Nenhuma prestadora recusada.",
+  const PROVIDER_STATUS = { pending: "Pendente", active: "Aprovada", rejected: "Recusada" };
+  const VERIFICATION_STATUS = { pending: "Pendente", approved: "Aprovada", rejected: "Recusada" };
+  const VERIFICATION_TYPES = {
+    cpf_selfie: "CPF e selfie",
+    gender_eligibility: "Elegibilidade",
+    background_check: "Antecedentes",
+    proof_of_address: "Comprovante de endereço",
+    references: "Referências",
   };
+  const PLAN_FEATURES = [
+    ["finance", "Financeiro"],
+    ["clients", "Clientes"],
+    ["statistics", "Estatísticas"],
+    ["promotions", "Promoções"],
+    ["team", "Equipe"],
+  ];
   const LOCATION_LABELS = { at_customer: "vai até a cliente", at_provider: "recebe no espaço" };
-  const PRICE_TYPE_LABELS = { fixed: "", from: "a partir de ", evaluation: "sob avaliação" };
   const ERROR_MESSAGES = {
     invalid_credentials: "E-mail ou senha inválidos.",
     forbidden: "Esta conta não tem acesso de administrador.",
     rate_limited: "Muitas tentativas. Aguarde alguns minutos e tente de novo.",
     upstream_unavailable: "O serviço de login não respondeu. Tente novamente em instantes.",
     not_configured: "O painel não está configurado (MARKETPLACE_API_URL).",
+    validation_error: "Confira os dados informados.",
   };
+
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
   const elements = {
-    loginView: document.getElementById("login-view"),
-    loginForm: document.getElementById("login-form"),
-    loginEmail: document.getElementById("login-email"),
-    loginPassword: document.getElementById("login-password"),
-    loginError: document.getElementById("login-error"),
-    loginSubmit: document.getElementById("login-submit"),
-    appView: document.getElementById("app-view"),
-    adminName: document.getElementById("admin-name"),
-    logoutButton: document.getElementById("logout-button"),
-    refreshButton: document.getElementById("refresh-button"),
-    tabs: Array.from(document.querySelectorAll(".tab")),
-    listStatus: document.getElementById("list-status"),
-    list: document.getElementById("provider-list"),
-    loadMore: document.getElementById("load-more"),
-    toast: document.getElementById("toast"),
-    cardTemplate: document.getElementById("provider-card-template"),
+    loginView: $("#login-view"),
+    loginForm: $("#login-form"),
+    loginEmail: $("#login-email"),
+    loginPassword: $("#login-password"),
+    loginError: $("#login-error"),
+    loginSubmit: $("#login-submit"),
+    appView: $("#app-view"),
+    adminName: $("#admin-name"),
+    logoutButton: $("#logout-button"),
+    sectionLinks: $$(".section-link"),
+    toast: $("#toast"),
   };
-
-  const state = { status: "pending", offset: 0, loading: false };
   let toastTimer;
 
   // ---------- Sessão ----------
 
-  function readSession() {
+  function readStoredSession() {
     try {
       return JSON.parse(sessionStorage.getItem(SESSION_KEY)) || null;
     } catch {
@@ -55,25 +61,25 @@
     }
   }
 
-  function saveSession(session) {
+  let session = readStoredSession();
+
+  function saveSession(next) {
+    session = next;
     try {
-      sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify(next));
     } catch {
-      // Sem armazenamento (ex.: janela privada restrita): a sessão vale até recarregar.
+      // Sem armazenamento: a sessão vale até recarregar a página.
     }
-    memorySession = session;
   }
 
   function clearSession() {
+    session = null;
     try {
       sessionStorage.removeItem(SESSION_KEY);
     } catch {
       /* ignorado */
     }
-    memorySession = null;
   }
-
-  let memorySession = readSession();
 
   // ---------- HTTP ----------
 
@@ -91,11 +97,7 @@
     if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
     let response;
     try {
-      response = await fetch(path, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
+      response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
     } catch {
       throw new ApiError(0, "network", "Sem conexão com o servidor.");
     }
@@ -109,92 +111,191 @@
 
   // Chamada autenticada; renova o token uma vez se ele expirou (dura 15 min).
   async function api(method, path, body) {
-    if (!memorySession) throw new ApiError(401, "unauthorized", "Faça login.");
+    if (!session) throw new ApiError(401, "unauthorized", "Faça login.");
     try {
-      return await request(method, path, body, memorySession.accessToken);
+      return await request(method, path, body, session.accessToken);
     } catch (error) {
       if (error.status !== 401) throw error;
       try {
-        saveSession(await request("POST", "/api/v1/admin/session/refresh", {
-          refreshToken: memorySession.refreshToken,
-        }));
+        saveSession(await request("POST", "/api/v1/admin/session/refresh", { refreshToken: session.refreshToken }));
       } catch {
         showLogin("Sua sessão expirou. Entre novamente.");
         throw error;
       }
-      return request(method, path, body, memorySession.accessToken);
+      return request(method, path, body, session.accessToken);
     }
   }
 
-  // ---------- Telas ----------
-
-  function showLogin(message) {
-    clearSession();
-    elements.appView.hidden = true;
-    elements.loginView.hidden = false;
-    elements.loginError.hidden = !message;
-    elements.loginError.textContent = message ?? "";
-    elements.loginPassword.value = "";
-    elements.loginEmail.focus();
-  }
-
-  function showApp() {
-    elements.loginView.hidden = true;
-    elements.appView.hidden = false;
-    elements.adminName.textContent = memorySession.user?.name ?? memorySession.user?.email ?? "";
-    loadProviders({ reset: true });
-  }
+  // ---------- Utilidades de interface ----------
 
   function showToast(message, isError = false) {
     clearTimeout(toastTimer);
     elements.toast.textContent = message;
     elements.toast.classList.toggle("error", isError);
     elements.toast.hidden = false;
-    toastTimer = setTimeout(() => {
-      elements.toast.hidden = true;
-    }, 4000);
+    toastTimer = setTimeout(() => { elements.toast.hidden = true; }, 4000);
   }
-
-  // ---------- Lista ----------
 
   const dateFormatter = new Intl.DateTimeFormat("pt-BR", { dateStyle: "medium", timeStyle: "short" });
   const currencyFormatter = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+  const formatDate = (value) => (value ? dateFormatter.format(new Date(value)) : "—");
 
   function formatPhone(phone) {
     const match = /^\+55(\d{2})(\d{4,5})(\d{4})$/.exec(phone ?? "");
     return match ? `+55 (${match[1]}) ${match[2]}-${match[3]}` : phone ?? "—";
   }
 
-  function serviceDescription(service) {
-    const parts = [service.category];
-    if (service.priceType === "evaluation") parts.push("sob avaliação");
-    else parts.push(`${PRICE_TYPE_LABELS[service.priceType] ?? ""}${currencyFormatter.format(service.basePrice)}`);
-    parts.push(LOCATION_LABELS[service.serviceLocation] ?? service.serviceLocation);
-    return parts.filter(Boolean).join(" · ");
+  function cloneTemplate(id) {
+    return document.getElementById(id).content.firstElementChild.cloneNode(true);
   }
 
-  function renderProvider(provider) {
-    const card = elements.cardTemplate.content.firstElementChild.cloneNode(true);
-    card.dataset.providerId = provider.id;
-    card.querySelector(".card-name").textContent = provider.name;
-    card.querySelector(".card-meta").textContent = `Cadastro em ${dateFormatter.format(new Date(provider.createdAt))}`;
+  function setBadge(badge, text, variant) {
+    badge.textContent = text;
+    badge.className = `badge ${variant}`;
+  }
 
-    const badge = card.querySelector(".badge");
-    badge.textContent = STATUS_LABELS[provider.activationStatus] ?? provider.activationStatus;
-    badge.classList.add(provider.activationStatus);
+  // Ações de aprovar/recusar com motivo obrigatório na recusa.
+  // `send(change)` faz a chamada; o cartão sai da lista quando dá certo.
+  function wireDecision(card, { canApprove, canReject, send, onDone }) {
+    const approveButton = $(".action-approve", card);
+    const rejectButton = $(".action-reject", card);
+    const rejectForm = $(".reject-form", card);
+    const reasonInput = $(".reject-reason", card);
 
-    card.querySelector(".card-email").textContent = provider.email;
-    card.querySelector(".card-phone").textContent = formatPhone(provider.phone);
-    card.querySelector(".card-identity").textContent = provider.identityVerified ? "Verificada" : "Não verificada";
+    const resetButtons = () => {
+      approveButton.hidden = !canApprove;
+      rejectButton.hidden = !canReject;
+    };
+    resetButtons();
 
-    const bio = card.querySelector(".card-bio");
+    async function submit(change, buttons) {
+      buttons.forEach((button) => { button.disabled = true; });
+      try {
+        await send(change);
+        card.remove();
+        onDone(change);
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+    }
+
+    approveButton.addEventListener("click", () => submit({ approve: true }, [approveButton, rejectButton]));
+    rejectButton.addEventListener("click", () => {
+      rejectForm.hidden = false;
+      approveButton.hidden = true;
+      rejectButton.hidden = true;
+      reasonInput.focus();
+    });
+    $(".action-cancel", card).addEventListener("click", () => {
+      rejectForm.hidden = true;
+      resetButtons();
+    });
+    rejectForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const reason = reasonInput.value.trim();
+      if (!reason) {
+        reasonInput.focus();
+        showToast("Informe o motivo da recusa.", true);
+        return;
+      }
+      submit({ approve: false, reason }, $$("button", rejectForm));
+    });
+  }
+
+  // ---------- Lista paginada com abas (prestadoras e verificações) ----------
+
+  function createListSection({ panel, initialFilter, path, renderItem, emptyMessages }) {
+    const state = { filter: initialFilter, offset: 0, loading: false };
+    const list = $(".item-list", panel);
+    const status = $(".list-status", panel);
+    const loadMore = $(".load-more", panel);
+    const refreshButton = $(".refresh-button", panel);
+    const tabs = $$(".tab", panel);
+
+    function renderEmpty() {
+      const empty = document.createElement("p");
+      empty.className = "empty-state";
+      empty.textContent = emptyMessages[state.filter];
+      list.replaceChildren(empty);
+      status.textContent = "";
+    }
+
+    function itemRemoved() {
+      if (!list.querySelector(".card")) renderEmpty();
+    }
+
+    async function load({ reset }) {
+      if (state.loading) return;
+      state.loading = true;
+      if (reset) {
+        state.offset = 0;
+        list.replaceChildren();
+      }
+      loadMore.hidden = true;
+      status.textContent = "Carregando...";
+      refreshButton.disabled = true;
+      try {
+        const page = await api("GET", path(state.filter, state.offset, PAGE_SIZE));
+        const items = page?.items ?? [];
+        if (reset && items.length === 0) {
+          renderEmpty();
+          return;
+        }
+        list.append(...items.map((item) => renderItem(item, state.filter, itemRemoved)));
+        state.offset += items.length;
+        loadMore.hidden = items.length < PAGE_SIZE;
+        status.textContent = "";
+      } catch (error) {
+        if (error.status !== 401) status.textContent = `Não foi possível carregar: ${error.message}`;
+      } finally {
+        state.loading = false;
+        refreshButton.disabled = false;
+      }
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => {
+        if (state.loading || tab.dataset.filter === state.filter) return;
+        state.filter = tab.dataset.filter;
+        tabs.forEach((other) => other.setAttribute("aria-pressed", String(other === tab)));
+        load({ reset: true });
+      });
+    });
+    refreshButton.addEventListener("click", () => load({ reset: true }));
+    loadMore.addEventListener("click", () => load({ reset: false }));
+
+    return { load: () => load({ reset: true }) };
+  }
+
+  // ---------- Prestadoras ----------
+
+  function serviceDescription(service) {
+    const price = service.priceType === "evaluation"
+      ? "sob avaliação"
+      : `${service.priceType === "from" ? "a partir de " : ""}${currencyFormatter.format(service.basePrice)}`;
+    return [service.category, price, LOCATION_LABELS[service.serviceLocation] ?? service.serviceLocation]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  function renderProvider(provider, _filter, onRemoved) {
+    const card = cloneTemplate("provider-card-template");
+    $(".card-name", card).textContent = provider.name;
+    $(".card-meta", card).textContent = `Cadastro em ${formatDate(provider.createdAt)}`;
+    setBadge($(".plan-badge", card), `Plano ${provider.planName ?? "Grátis"}`, "neutral");
+    setBadge($(".status-badge", card), PROVIDER_STATUS[provider.activationStatus] ?? provider.activationStatus, provider.activationStatus);
+    $(".card-email", card).textContent = provider.email;
+    $(".card-phone", card).textContent = formatPhone(provider.phone);
+    $(".card-identity", card).textContent = provider.identityVerified ? "Sim" : "Não";
+
+    const bio = $(".card-bio", card);
     bio.textContent = provider.bio?.trim() || "Sem descrição.";
     bio.classList.toggle("empty", !provider.bio?.trim());
 
     const services = provider.services ?? [];
-    card.querySelector(".card-services-title").textContent =
-      services.length === 1 ? "1 serviço" : `${services.length} serviços`;
-    const serviceList = card.querySelector(".card-services");
+    $(".card-services-title", card).textContent = services.length === 1 ? "1 serviço" : `${services.length} serviços`;
+    const serviceList = $(".card-services", card);
     if (services.length === 0) {
       const item = document.createElement("li");
       item.className = "empty";
@@ -212,112 +313,222 @@
       serviceList.append(item);
     }
 
-    wireActions(card, provider);
+    if (provider.activationStatus !== "pending") {
+      $(".action-approve", card).textContent = "Reativar e aprovar";
+      $(".action-reject", card).textContent = "Recusar e remover das buscas";
+    }
+    wireDecision(card, {
+      canApprove: provider.activationStatus !== "active",
+      canReject: provider.activationStatus !== "rejected",
+      send: (change) => api("PATCH", `/api/v1/admin/providers/${encodeURIComponent(provider.id)}/approval`,
+        change.approve ? { status: "active" } : { status: "rejected", reason: change.reason }),
+      onDone: (change) => {
+        showToast(change.approve
+          ? `${provider.name} foi aprovada e verificada; já aparece nas buscas.`
+          : `${provider.name} foi recusada. Ela será notificada no app.`);
+        onRemoved();
+      },
+    });
     return card;
   }
 
-  function wireActions(card, provider) {
-    const approveButton = card.querySelector(".action-approve");
-    const rejectButton = card.querySelector(".action-reject");
-    const rejectForm = card.querySelector(".reject-form");
-    const reasonInput = card.querySelector(".reject-reason");
+  // ---------- Verificações ----------
 
-    // Só mostra a ação que muda o status atual
-    approveButton.hidden = provider.activationStatus === "active";
-    rejectButton.hidden = provider.activationStatus === "rejected";
-    if (provider.activationStatus !== "pending") {
-      approveButton.textContent = "Reativar e aprovar";
-      rejectButton.textContent = "Recusar e remover das buscas";
+  function roleLabel(roles = []) {
+    const isProvider = roles.includes("prestadora");
+    const isCustomer = roles.includes("cliente");
+    if (isProvider && isCustomer) return "Cliente e prestadora";
+    return isProvider ? "Prestadora" : "Cliente";
+  }
+
+  function renderVerification(verification, filter, onRemoved) {
+    const card = cloneTemplate("verification-card-template");
+    $(".card-name", card).textContent = verification.name;
+    $(".card-meta", card).textContent = verification.reviewedAt
+      ? `Solicitada em ${formatDate(verification.createdAt)} · revisada em ${formatDate(verification.reviewedAt)}`
+      : `Solicitada em ${formatDate(verification.createdAt)}`;
+    setBadge($(".role-badge", card), roleLabel(verification.roles), "neutral");
+    setBadge($(".status-badge", card), VERIFICATION_STATUS[verification.result] ?? verification.result, verification.result);
+    $(".card-email", card).textContent = verification.email;
+    $(".card-phone", card).textContent = formatPhone(verification.phone);
+    $(".card-type", card).textContent = VERIFICATION_TYPES[verification.type] ?? verification.type;
+
+    if (verification.reviewNote) {
+      const note = $(".review-note", card);
+      note.textContent = verification.result === "rejected"
+        ? `Motivo: ${verification.reviewNote}`
+        : verification.reviewNote;
+      note.hidden = false;
     }
 
-    approveButton.addEventListener("click", () =>
-      changeApproval(card, provider, { status: "active" }, [approveButton, rejectButton]));
-
-    rejectButton.addEventListener("click", () => {
-      rejectForm.hidden = false;
-      rejectButton.hidden = true;
-      approveButton.hidden = true;
-      reasonInput.focus();
+    // Só pedidos pendentes recebem decisão
+    wireDecision(card, {
+      canApprove: filter === "pending",
+      canReject: filter === "pending",
+      send: (change) => api("PATCH", `/api/v1/admin/verifications/${encodeURIComponent(verification.id)}`,
+        change.approve ? { result: "approved" } : { result: "rejected", reason: change.reason }),
+      onDone: (change) => {
+        showToast(change.approve
+          ? `Identidade de ${verification.name} confirmada.`
+          : `Verificação de ${verification.name} recusada. A pessoa será notificada.`);
+        onRemoved();
+      },
     });
+    return card;
+  }
 
-    card.querySelector(".action-cancel").addEventListener("click", () => {
-      rejectForm.hidden = true;
-      wireVisibilityReset();
-    });
+  // ---------- Planos ----------
 
-    rejectForm.addEventListener("submit", (event) => {
+  function renderPlan(plan) {
+    const form = cloneTemplate("plan-card-template");
+    $(".plan-title", form).textContent = plan.displayName;
+    setBadge($(".plan-code", form), plan.planCode, "neutral");
+    $(".plan-name", form).value = plan.displayName;
+    $(".plan-description", form).value = plan.description ?? "";
+    $(".plan-limit", form).value = plan.monthlyApprovalLimit ?? "";
+    $(".plan-active", form).checked = plan.active;
+
+    const features = plan.features ?? {};
+    const featureSet = $(".plan-features", form);
+    for (const [key, label] of PLAN_FEATURES) {
+      const option = document.createElement("label");
+      option.className = "check";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.dataset.feature = key;
+      checkbox.checked = features[key] === true;
+      option.append(checkbox, document.createTextNode(label));
+      featureSet.append(option);
+    }
+
+    form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const reason = reasonInput.value.trim();
-      if (!reason) {
-        reasonInput.focus();
-        showToast("Informe o motivo da recusa.", true);
+      const displayName = $(".plan-name", form).value.trim();
+      const limitText = $(".plan-limit", form).value.trim();
+      const limit = limitText === "" ? null : Number(limitText);
+      if (displayName.length < 2) {
+        showToast("O nome do plano precisa de pelo menos 2 caracteres.", true);
         return;
       }
-      changeApproval(card, provider, { status: "rejected", reason },
-        Array.from(rejectForm.querySelectorAll("button")));
+      if (limit !== null && (!Number.isInteger(limit) || limit < 0 || limit > 100000)) {
+        showToast("O limite mensal deve ser um número inteiro entre 0 e 100000.", true);
+        return;
+      }
+      // Mantém outras chaves de "features" que o painel não edita
+      const nextFeatures = { ...features };
+      $$("input[data-feature]", form).forEach((checkbox) => {
+        nextFeatures[checkbox.dataset.feature] = checkbox.checked;
+      });
+      const description = $(".plan-description", form).value.trim();
+      const submitButton = $("button[type=submit]", form);
+      submitButton.disabled = true;
+      try {
+        const saved = await api("PUT", `/api/v1/admin/plans/${encodeURIComponent(plan.planCode)}`, {
+          displayName,
+          description: description || null,
+          monthlyApprovalLimit: limit,
+          features: nextFeatures,
+          active: $(".plan-active", form).checked,
+        });
+        Object.assign(plan, saved);
+        $(".plan-title", form).textContent = saved.displayName;
+        showToast(`Plano ${saved.displayName} salvo.`);
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+      } finally {
+        submitButton.disabled = false;
+      }
     });
-
-    function wireVisibilityReset() {
-      approveButton.hidden = provider.activationStatus === "active";
-      rejectButton.hidden = provider.activationStatus === "rejected";
-    }
+    return form;
   }
 
-  async function changeApproval(card, provider, change, buttons) {
-    buttons.forEach((button) => { button.disabled = true; });
-    try {
-      await api("PATCH", `/api/v1/admin/providers/${encodeURIComponent(provider.id)}/approval`, change);
-      card.remove();
-      showToast(change.status === "active"
-        ? `${provider.name} foi aprovada e já aparece nas buscas.`
-        : `${provider.name} foi recusada. Ela será notificada no app.`);
-      if (!elements.list.querySelector(".card")) renderEmpty();
-    } catch (error) {
-      if (error.status !== 401) showToast(error.message, true);
-      buttons.forEach((button) => { button.disabled = false; });
-    }
-  }
+  function createPlansSection(panel) {
+    const list = $(".item-list", panel);
+    const status = $(".list-status", panel);
+    const refreshButton = $(".refresh-button", panel);
 
-  function renderEmpty() {
-    const empty = document.createElement("p");
-    empty.className = "empty-state";
-    empty.textContent = EMPTY_MESSAGES[state.status];
-    elements.list.replaceChildren(empty);
-    elements.listStatus.textContent = "";
-  }
-
-  async function loadProviders({ reset }) {
-    if (state.loading) return;
-    state.loading = true;
-    if (reset) {
-      state.offset = 0;
-      elements.list.replaceChildren();
-    }
-    elements.loadMore.hidden = true;
-    elements.listStatus.textContent = "Carregando...";
-    elements.refreshButton.disabled = true;
-
-    try {
-      const query = new URLSearchParams({ status: state.status, limit: String(PAGE_SIZE), offset: String(state.offset) });
-      const page = await api("GET", `/api/v1/admin/providers?${query}`);
-      const items = page?.items ?? [];
-      if (reset && items.length === 0) {
-        renderEmpty();
-        return;
+    async function load() {
+      status.textContent = "Carregando...";
+      refreshButton.disabled = true;
+      try {
+        const plans = await api("GET", "/api/v1/admin/plans");
+        list.replaceChildren(...(plans ?? []).map(renderPlan));
+        status.textContent = "";
+      } catch (error) {
+        if (error.status !== 401) status.textContent = `Não foi possível carregar: ${error.message}`;
+      } finally {
+        refreshButton.disabled = false;
       }
-      elements.list.append(...items.map(renderProvider));
-      state.offset += items.length;
-      elements.loadMore.hidden = items.length < PAGE_SIZE;
-      elements.listStatus.textContent = "";
-    } catch (error) {
-      if (error.status !== 401) elements.listStatus.textContent = `Não foi possível carregar: ${error.message}`;
-    } finally {
-      state.loading = false;
-      elements.refreshButton.disabled = false;
+    }
+    refreshButton.addEventListener("click", load);
+    return { load };
+  }
+
+  // ---------- Seções ----------
+
+  const panels = Object.fromEntries($$("[data-section-panel]").map((panel) => [panel.dataset.sectionPanel, panel]));
+  const sections = {
+    providers: createListSection({
+      panel: panels.providers,
+      initialFilter: "pending",
+      path: (filter, offset, limit) =>
+        `/api/v1/admin/providers?${new URLSearchParams({ status: filter, limit, offset })}`,
+      renderItem: renderProvider,
+      emptyMessages: {
+        pending: "Nenhuma prestadora aguardando aprovação.",
+        active: "Nenhuma prestadora aprovada ainda.",
+        rejected: "Nenhuma prestadora recusada.",
+      },
+    }),
+    verifications: createListSection({
+      panel: panels.verifications,
+      initialFilter: "pending",
+      path: (filter, offset, limit) =>
+        `/api/v1/admin/verifications?${new URLSearchParams({ result: filter, limit, offset })}`,
+      renderItem: renderVerification,
+      emptyMessages: {
+        pending: "Nenhuma verificação aguardando revisão.",
+        approved: "Nenhuma verificação aprovada ainda.",
+        rejected: "Nenhuma verificação recusada.",
+      },
+    }),
+    plans: createPlansSection(panels.plans),
+  };
+  const loaded = new Set();
+
+  function openSection(name) {
+    elements.sectionLinks.forEach((link) => {
+      if (link.dataset.section === name) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+    Object.entries(panels).forEach(([key, panel]) => { panel.hidden = key !== name; });
+    if (!loaded.has(name)) {
+      loaded.add(name);
+      sections[name].load();
     }
   }
 
-  // ---------- Eventos ----------
+  elements.sectionLinks.forEach((link) => link.addEventListener("click", () => openSection(link.dataset.section)));
+
+  // ---------- Login e logout ----------
+
+  function showLogin(message) {
+    clearSession();
+    loaded.clear();
+    elements.appView.hidden = true;
+    elements.loginView.hidden = false;
+    elements.loginError.hidden = !message;
+    elements.loginError.textContent = message ?? "";
+    elements.loginPassword.value = "";
+    elements.loginEmail.focus();
+  }
+
+  function showApp() {
+    elements.loginView.hidden = true;
+    elements.appView.hidden = false;
+    elements.adminName.textContent = session.user?.name ?? session.user?.email ?? "";
+    openSection("providers");
+  }
 
   elements.loginForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -345,27 +556,11 @@
   });
 
   elements.logoutButton.addEventListener("click", async () => {
-    const refreshToken = memorySession?.refreshToken;
-    if (refreshToken) {
-      await request("POST", "/api/v1/admin/session/logout", { refreshToken }).catch(() => {});
-    }
+    const refreshToken = session?.refreshToken;
+    if (refreshToken) await request("POST", "/api/v1/admin/session/logout", { refreshToken }).catch(() => {});
     showLogin();
   });
 
-  elements.tabs.forEach((tab) => {
-    tab.addEventListener("click", () => {
-      if (state.loading || tab.dataset.status === state.status) return;
-      state.status = tab.dataset.status;
-      elements.tabs.forEach((other) => other.setAttribute("aria-pressed", String(other === tab)));
-      loadProviders({ reset: true });
-    });
-  });
-
-  elements.refreshButton.addEventListener("click", () => loadProviders({ reset: true }));
-  elements.loadMore.addEventListener("click", () => loadProviders({ reset: false }));
-
-  // ---------- Início ----------
-
-  if (memorySession?.accessToken) showApp();
+  if (session?.accessToken) showApp();
   else showLogin();
 })();

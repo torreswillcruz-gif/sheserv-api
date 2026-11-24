@@ -32,38 +32,72 @@
   <div id="app-view" hidden>
     <header class="topbar">
       <p class="brand">SheServe <span>Admin</span></p>
+      <nav class="sections" aria-label="Seções do painel">
+        <button type="button" class="section-link" data-section="providers" aria-current="page">Prestadoras</button>
+        <button type="button" class="section-link" data-section="verifications">Verificações</button>
+        <button type="button" class="section-link" data-section="plans">Planos</button>
+      </nav>
       <div class="topbar-user">
         <span id="admin-name" class="muted"></span>
         <button id="logout-button" type="button" class="button ghost">Sair</button>
       </div>
     </header>
 
-    <main class="content">
+    <!-- Prestadoras -->
+    <main class="content" data-section-panel="providers">
       <div class="page-head">
         <div>
           <h1>Aprovação de prestadoras</h1>
-          <p class="muted">Revise o perfil e os serviços antes de liberar a prestadora nas buscas.</p>
+          <p class="muted">Aprovar já marca a prestadora como verificada e a libera nas buscas do app.</p>
         </div>
-        <button id="refresh-button" type="button" class="button ghost">Atualizar</button>
+        <button type="button" class="button ghost refresh-button">Atualizar</button>
       </div>
-
-      <nav class="tabs" aria-label="Filtrar por status">
-        <button type="button" class="tab" data-status="pending" aria-pressed="true">Pendentes</button>
-        <button type="button" class="tab" data-status="active" aria-pressed="false">Aprovadas</button>
-        <button type="button" class="tab" data-status="rejected" aria-pressed="false">Recusadas</button>
+      <nav class="tabs" aria-label="Filtrar prestadoras por status">
+        <button type="button" class="tab" data-filter="pending" aria-pressed="true">Pendentes</button>
+        <button type="button" class="tab" data-filter="active" aria-pressed="false">Aprovadas</button>
+        <button type="button" class="tab" data-filter="rejected" aria-pressed="false">Recusadas</button>
       </nav>
+      <p class="list-status muted" role="status"></p>
+      <section class="item-list" aria-live="polite"></section>
+      <div class="list-footer"><button type="button" class="button ghost load-more" hidden>Carregar mais</button></div>
+    </main>
 
-      <p id="list-status" class="muted" role="status"></p>
-      <section id="provider-list" class="provider-list" aria-live="polite"></section>
-      <div class="list-footer">
-        <button id="load-more" type="button" class="button ghost" hidden>Carregar mais</button>
+    <!-- Verificações -->
+    <main class="content" data-section-panel="verifications" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Verificações de identidade</h1>
+          <p class="muted">Confirme a identidade por fora (vídeo, WhatsApp) e registre o resultado aqui.</p>
+        </div>
+        <button type="button" class="button ghost refresh-button">Atualizar</button>
       </div>
+      <nav class="tabs" aria-label="Filtrar verificações por resultado">
+        <button type="button" class="tab" data-filter="pending" aria-pressed="true">Pendentes</button>
+        <button type="button" class="tab" data-filter="approved" aria-pressed="false">Aprovadas</button>
+        <button type="button" class="tab" data-filter="rejected" aria-pressed="false">Recusadas</button>
+      </nav>
+      <p class="list-status muted" role="status"></p>
+      <section class="item-list" aria-live="polite"></section>
+      <div class="list-footer"><button type="button" class="button ghost load-more" hidden>Carregar mais</button></div>
+    </main>
+
+    <!-- Planos -->
+    <main class="content" data-section-panel="plans" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Planos</h1>
+          <p class="muted">Defina limites e módulos de cada plano. A prestadora muda de plano pelo pagamento no app.</p>
+        </div>
+        <button type="button" class="button ghost refresh-button">Atualizar</button>
+      </div>
+      <p class="list-status muted" role="status"></p>
+      <section class="item-list plan-grid" aria-live="polite"></section>
     </main>
   </div>
 
   <div id="toast" class="toast" role="status" hidden></div>
 
-  <!-- Modelo de cartão de prestadora -->
+  <!-- Modelo: cartão de prestadora -->
   <template id="provider-card-template">
     <article class="card">
       <div class="card-head">
@@ -71,12 +105,15 @@
           <h2 class="card-name"></h2>
           <p class="card-meta muted"></p>
         </div>
-        <span class="badge"></span>
+        <div class="badges">
+          <span class="badge plan-badge"></span>
+          <span class="badge status-badge"></span>
+        </div>
       </div>
       <dl class="card-contact">
         <div><dt>E-mail</dt><dd class="card-email"></dd></div>
         <div><dt>Telefone</dt><dd class="card-phone"></dd></div>
-        <div><dt>Identidade</dt><dd class="card-identity"></dd></div>
+        <div><dt>Verificada</dt><dd class="card-identity"></dd></div>
       </dl>
       <div class="card-section">
         <h3>Sobre o trabalho</h3>
@@ -101,6 +138,75 @@
         </div>
       </form>
     </article>
+  </template>
+
+  <!-- Modelo: cartão de verificação -->
+  <template id="verification-card-template">
+    <article class="card">
+      <div class="card-head">
+        <div>
+          <h2 class="card-name"></h2>
+          <p class="card-meta muted"></p>
+        </div>
+        <div class="badges">
+          <span class="badge role-badge"></span>
+          <span class="badge status-badge"></span>
+        </div>
+      </div>
+      <dl class="card-contact">
+        <div><dt>E-mail</dt><dd class="card-email"></dd></div>
+        <div><dt>Telefone</dt><dd class="card-phone"></dd></div>
+        <div><dt>Tipo</dt><dd class="card-type"></dd></div>
+      </dl>
+      <p class="review-note" hidden></p>
+      <div class="card-actions">
+        <button type="button" class="button primary action-approve">Confirmar identidade</button>
+        <button type="button" class="button danger-outline action-reject">Recusar</button>
+      </div>
+      <form class="reject-form" hidden>
+        <label>
+          Motivo da recusa (enviado à pessoa)
+          <textarea class="reject-reason" rows="3" maxlength="500" required></textarea>
+        </label>
+        <div class="card-actions">
+          <button type="submit" class="button danger">Confirmar recusa</button>
+          <button type="button" class="button ghost action-cancel">Cancelar</button>
+        </div>
+      </form>
+    </article>
+  </template>
+
+  <!-- Modelo: plano -->
+  <template id="plan-card-template">
+    <form class="card plan-card" novalidate>
+      <div class="card-head">
+        <h2 class="plan-title"></h2>
+        <span class="badge plan-code"></span>
+      </div>
+      <label>
+        Nome exibido
+        <input class="plan-name" type="text" maxlength="120" required>
+      </label>
+      <label>
+        Descrição
+        <textarea class="plan-description" rows="2" maxlength="500"></textarea>
+      </label>
+      <label>
+        Orçamentos aprovados por mês
+        <input class="plan-limit" type="number" min="0" max="100000" step="1" placeholder="Sem limite">
+        <span class="hint">Deixe em branco para ilimitado.</span>
+      </label>
+      <fieldset class="plan-features">
+        <legend>Módulos liberados</legend>
+      </fieldset>
+      <label class="check">
+        <input class="plan-active" type="checkbox">
+        Plano disponível para contratação
+      </label>
+      <div class="card-actions">
+        <button type="submit" class="button primary">Salvar plano</button>
+      </div>
+    </form>
   </template>
 </body>
 </html>
