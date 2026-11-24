@@ -36,14 +36,21 @@ O cadastro público não pode criar administradores.
 - `GET/POST /api/v1/quotes/{id}/messages` lista e envia mensagens da negociação.
 - `POST /api/v1/quotes/{id}/counter` salva uma contraproposta e nova validade.
 - `POST /api/v1/quotes/{id}/reject` recusa uma proposta.
-- Mini-ERP: `/api/v1/me/plan`, `/financial`, `/clients`, `/stats`, `/promotions`,
-  `/purchases`, `/team` e `/notifications`.
+- Mini-ERP: `/api/v1/me/plan`, `/financial`, `/inventory`, `/clients`, `/stats`, `/insights`,
+  `/promotions`, `/purchases`, `/team` e `/notifications`.
 - O painel financeiro é servido por `/api/v1/me/financial/dashboard?period=week|month|year`;
-  o fluxo de caixa agrega dias, semanas do mês ou meses do ano.
+  o fluxo de caixa agrega dias, semanas do mês ou meses do ano, e `byCategory` separa o que
+  veio de atendimentos do app do que entrou por fora. Um "a receber" pode ser marcado como
+  recebido (`PATCH .../entries/{id}/received`) e lançamentos feitos à mão podem ser excluídos.
 - Ao concluir um atendimento, a API cria uma única movimentação "A receber" ligada ao pedido.
   Ela permanece como recebível enquanto o repasse estiver pendente.
 - `/api/v1/me/stats` inclui atendimentos e clientes atendidos, valores concluídos e série
   mensal de atendimentos, clientes, receitas e despesas.
+- `/api/v1/me/insights` devolve os totais mensais do financeiro (6 meses fechados + o atual)
+  e o resumo do inventário; o app calcula as dicas, o ponto de equilíbrio e a previsão.
+- Inventário (`/api/v1/me/inventory`, recurso `inventory`, do Standard em diante): itens com
+  quantidade, mínimo e custo; compra, uso, perda e contagem em transação, sem deixar o estoque
+  negativo (409 `insufficient_stock`). Compra e perda podem gerar a saída no financeiro.
 - O pagamento externo continua dependente de gateway aprovado e conta da loja.
 - Máximo de 3 orçamentos abertos por solicitação.
 - Limites mensais: Gratuito 20; Standard 40; Pro 100; Premium ilimitado.
