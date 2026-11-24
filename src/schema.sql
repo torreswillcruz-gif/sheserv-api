@@ -283,13 +283,13 @@ CREATE TABLE IF NOT EXISTS plan_catalog (
 INSERT INTO plan_catalog (plan_code,display_name,description,monthly_approval_limit,features)
 VALUES
   ('free','Grátis','Recursos básicos da prestadora.',20,
-    '{"finance":true,"clients":false,"statistics":false,"promotions":false,"team":false}'::jsonb),
+    '{"finance":true,"inventory":false,"clients":false,"statistics":false,"promotions":false,"team":false}'::jsonb),
   ('standard','Standard','Mais solicitações de orçamento por mês.',40,
-    '{"finance":true,"clients":true,"statistics":true,"promotions":false,"team":false}'::jsonb),
+    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":false,"team":false}'::jsonb),
   ('pro','Pro','Limite ampliado de solicitações de orçamento.',100,
-    '{"finance":true,"clients":true,"statistics":true,"promotions":true,"team":false}'::jsonb),
+    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":true,"team":false}'::jsonb),
   ('premium','Premium','Solicitações sem limite fixo e gestão de equipe.',NULL,
-    '{"finance":true,"clients":true,"statistics":true,"promotions":true,"team":true}'::jsonb)
+    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":true,"team":true}'::jsonb)
 ON CONFLICT (plan_code) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS provider_plans (
@@ -559,3 +559,39 @@ ALTER TABLE categories ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL 
 -- Categorias criadas antes do ícone existir: o id já era a chave do ícone no app
 UPDATE categories SET icon=id
 WHERE icon='general' AND id IN ('cleaning','beauty','fashion','cooking','learning','repairs');
+
+-- Inventário da prestadora: produtos e materiais com quantidade, mínimo e custo.
+-- Cada mudança de quantidade fica em inventory_movements; compra e perda podem
+-- gerar a saída correspondente no financeiro (financial_entry_id).
+CREATE TABLE IF NOT EXISTS inventory_items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  unit text NOT NULL DEFAULT 'un',
+  quantity numeric(12,3) NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  min_quantity numeric(12,3) NOT NULL DEFAULT 0 CHECK (min_quantity >= 0),
+  unit_cost numeric(10,2) CHECK (unit_cost IS NULL OR unit_cost >= 0),
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_items_provider ON inventory_items(provider_id, active);
+
+CREATE TABLE IF NOT EXISTS inventory_movements (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  item_id uuid NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind text NOT NULL CHECK (kind IN ('purchase','use','loss','count')),
+  quantity_change numeric(12,3) NOT NULL,
+  quantity_after numeric(12,3) NOT NULL,
+  unit_cost numeric(10,2),
+  financial_entry_id uuid REFERENCES financial_entries(id) ON DELETE SET NULL,
+  note text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_movements_item ON inventory_movements(item_id, created_at);
+
+-- Recurso "inventory" nos planos (a partir do Standard), sem sobrescrever o
+-- que o admin já tiver definido.
+UPDATE plan_catalog SET features = features || jsonb_build_object('inventory', plan_code <> 'free')
+WHERE NOT features ? 'inventory';

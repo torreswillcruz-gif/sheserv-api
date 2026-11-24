@@ -18,6 +18,7 @@
   };
   const PLAN_FEATURES = [
     ["finance", "Financeiro"],
+    ["inventory", "Inventário"],
     ["clients", "Clientes"],
     ["statistics", "Estatísticas"],
     ["promotions", "Promoções"],

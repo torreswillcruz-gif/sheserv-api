@@ -263,6 +263,191 @@ erpRouter.delete("/me/financial/entries/:entryId", requirePlanFeature("finance")
   response.status(204).end();
 }));
 
+// ---------------------------------------------------------------------------
+// Inventário: produtos e materiais da prestadora.
+
+const INVENTORY_ITEM_COLUMNS = `id,name,unit,quantity::float,min_quantity::float AS "minQuantity",
+  unit_cost::float AS "unitCost",updated_at AS "updatedAt"`;
+
+const inventoryItemSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  unit: z.string().trim().min(1).max(10).default("un"),
+  quantity: z.number().min(0).max(1_000_000).default(0),
+  minQuantity: z.number().min(0).max(1_000_000).default(0),
+  unitCost: z.number().min(0).max(1_000_000).nullable().optional(),
+}).strict();
+
+erpRouter.get("/me/inventory", requirePlanFeature("inventory"), asyncHandler(async (request, response) => {
+  const { rows } = await runQuery(
+    `SELECT ${INVENTORY_ITEM_COLUMNS} FROM inventory_items
+     WHERE provider_id=$1 AND active ORDER BY name`,
+    [request.user.id]
+  );
+  const items = rows.map((item) => ({ ...item, lowStock: item.quantity <= item.minQuantity }));
+  response.json({
+    items,
+    summary: {
+      itemCount: items.length,
+      lowStockCount: items.filter((item) => item.lowStock).length,
+      stockValue: items.reduce((total, item) => total + item.quantity * (item.unitCost ?? 0), 0),
+    },
+  });
+}));
+
+erpRouter.post("/me/inventory", requirePlanFeature("inventory"), asyncHandler(async (request, response) => {
+  const data = inventoryItemSchema.parse(request.body);
+  const { rows } = await runQuery(
+    `INSERT INTO inventory_items (provider_id,name,unit,quantity,min_quantity,unit_cost)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING ${INVENTORY_ITEM_COLUMNS}`,
+    [request.user.id, data.name, data.unit, data.quantity, data.minQuantity, data.unitCost ?? null]
+  );
+  response.status(201).json(rows[0]);
+}));
+
+// A quantidade não muda aqui: só por movimentação, para ficar no histórico.
+erpRouter.put("/me/inventory/:itemId", requirePlanFeature("inventory"), asyncHandler(async (request, response) => {
+  const itemId = z.string().uuid().parse(request.params.itemId);
+  const data = inventoryItemSchema.omit({ quantity: true }).parse(request.body);
+  const { rows } = await runQuery(
+    `UPDATE inventory_items SET name=$3,unit=$4,min_quantity=$5,unit_cost=$6,updated_at=now()
+     WHERE id=$1 AND provider_id=$2 AND active RETURNING ${INVENTORY_ITEM_COLUMNS}`,
+    [itemId, request.user.id, data.name, data.unit, data.minQuantity, data.unitCost ?? null]
+  );
+  if (!rows[0]) throw new ApiError(404, "item_not_found", "Inventory item not found.");
+  response.json(rows[0]);
+}));
+
+// Arquiva (some da lista) sem apagar o histórico de movimentações.
+erpRouter.delete("/me/inventory/:itemId", requirePlanFeature("inventory"), asyncHandler(async (request, response) => {
+  const itemId = z.string().uuid().parse(request.params.itemId);
+  const { rows } = await runQuery(
+    `UPDATE inventory_items SET active=false,updated_at=now()
+     WHERE id=$1 AND provider_id=$2 AND active RETURNING id`,
+    [itemId, request.user.id]
+  );
+  if (!rows[0]) throw new ApiError(404, "item_not_found", "Inventory item not found.");
+  response.status(204).end();
+}));
+
+erpRouter.get("/me/inventory/:itemId/movements", requirePlanFeature("inventory"), asyncHandler(async (request, response) => {
+  const itemId = z.string().uuid().parse(request.params.itemId);
+  const { rows } = await runQuery(
+    `SELECT id,kind,quantity_change::float AS "quantityChange",quantity_after::float AS "quantityAfter",
+            unit_cost::float AS "unitCost",financial_entry_id AS "financialEntryId",note,
+            created_at AS "createdAt"
+     FROM inventory_movements WHERE item_id=$1 AND provider_id=$2
+     ORDER BY created_at DESC LIMIT 50`,
+    [itemId, request.user.id]
+  );
+  response.json(rows);
+}));
+
+const movementSchema = z.object({
+  // purchase: comprou (soma) · use: usou num atendimento (tira) ·
+  // loss: perdeu/estragou (tira) · count: contagem (quantity é o total contado)
+  kind: z.enum(["purchase", "use", "loss", "count"]),
+  quantity: z.number().min(0).max(1_000_000),
+  unitCost: z.number().min(0).max(1_000_000).nullable().optional(),
+  // Compra vira "Material e produtos" e perda vira "Prejuízo" no financeiro.
+  registerExpense: z.boolean().default(false),
+  note: z.string().trim().max(300).nullable().optional(),
+}).strict().refine((data) => data.kind === "count" || data.quantity > 0, {
+  message: "Quantity must be positive.", path: ["quantity"],
+});
+
+const roundQuantity = (value) => Math.round(value * 1000) / 1000;
+const roundMoney = (value) => Math.round(value * 100) / 100;
+
+erpRouter.post("/me/inventory/:itemId/movements", requirePlanFeature("inventory"), asyncHandler(async (request, response) => {
+  const itemId = z.string().uuid().parse(request.params.itemId);
+  const data = movementSchema.parse(request.body);
+  const result = await runInTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT id,name,unit,quantity::float,unit_cost::float AS "unitCost" FROM inventory_items
+       WHERE id=$1 AND provider_id=$2 AND active FOR UPDATE`,
+      [itemId, request.user.id]
+    );
+    const item = rows[0];
+    if (!item) throw new ApiError(404, "item_not_found", "Inventory item not found.");
+    const change = data.kind === "purchase" ? data.quantity
+      : data.kind === "count" ? data.quantity - item.quantity
+        : -data.quantity;
+    const quantityAfter = roundQuantity(item.quantity + change);
+    if (quantityAfter < 0) {
+      throw new ApiError(409, "insufficient_stock", "Not enough stock for this movement.", {
+        available: item.quantity,
+      });
+    }
+    // Compra com custo novo atualiza o custo unitário do item.
+    const unitCost = data.unitCost ?? item.unitCost ?? null;
+    let financialEntryId = null;
+    if (data.registerExpense && (data.kind === "purchase" || data.kind === "loss")) {
+      if (unitCost == null) {
+        throw new ApiError(422, "unit_cost_required", "A unit cost is needed to register the expense.");
+      }
+      const amount = roundMoney(Math.abs(change) * unitCost);
+      if (amount > 0) {
+        const entry = await client.query(
+          `INSERT INTO financial_entries (provider_id,entry_type,amount,category,description,occurred_at)
+           VALUES ($1,'expense',$2,$3,$4,now()) RETURNING id`,
+          [request.user.id, amount, data.kind === "purchase" ? "supplies" : "loss",
+           `${data.kind === "purchase" ? "Compra" : "Perda"}: ${Math.abs(change)} ${item.unit} de ${item.name}`]
+        );
+        financialEntryId = entry.rows[0].id;
+      }
+    }
+    const updated = await client.query(
+      `UPDATE inventory_items SET quantity=$2,unit_cost=$3,updated_at=now()
+       WHERE id=$1 RETURNING ${INVENTORY_ITEM_COLUMNS}`,
+      [itemId, quantityAfter, data.kind === "purchase" ? unitCost : item.unitCost ?? null]
+    );
+    await client.query(
+      `INSERT INTO inventory_movements
+        (item_id,provider_id,kind,quantity_change,quantity_after,unit_cost,financial_entry_id,note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [itemId, request.user.id, data.kind, roundQuantity(change), quantityAfter, unitCost,
+       financialEntryId, data.note ?? null]
+    );
+    return { item: updated.rows[0], financialEntryId };
+  });
+  response.status(201).json(result);
+}));
+
+// ---------------------------------------------------------------------------
+// Insights: números por mês para o app calcular gastos, previsão e quantos
+// atendimentos a prestadora precisa para ficar no lucro.
+
+erpRouter.get("/me/insights", requirePlanFeature("statistics"), asyncHandler(async (request, response) => {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  start.setDate(1);
+  start.setMonth(start.getMonth() - 6); // 6 meses fechados + o atual
+  const [financial, inventory] = await Promise.all([
+    runQuery(
+      `SELECT to_char(date_trunc('month', occurred_at),'YYYY-MM') AS month,
+              entry_type AS "entryType",category,
+              (source_order_id IS NOT NULL) AS "fromApp",
+              coalesce(sum(amount),0)::float AS total,count(*)::int AS count
+       FROM financial_entries
+       WHERE provider_id=$1 AND occurred_at >= $2
+       GROUP BY 1,2,3,4 ORDER BY 1`,
+      [request.user.id, start]
+    ),
+    runQuery(
+      `SELECT count(*) FILTER (WHERE quantity <= min_quantity)::int AS "lowStockCount",
+              coalesce(sum(quantity * coalesce(unit_cost,0)),0)::float AS "stockValue"
+       FROM inventory_items WHERE provider_id=$1 AND active`,
+      [request.user.id]
+    ),
+  ]);
+  response.json({
+    generatedAt: new Date().toISOString(),
+    since: start.toISOString(),
+    rows: financial.rows,
+    inventory: inventory.rows[0] ?? { lowStockCount: 0, stockValue: 0 },
+  });
+}));
+
 erpRouter.get("/me/clients", requirePlanFeature("clients"), asyncHandler(async (request, response) => {
   const { rows } = await runQuery(
     `SELECT c.customer_id AS "customerId",u.name,u.email,c.tags,c.notes,c.birthday,c.next_contact_at AS "nextContactAt"
