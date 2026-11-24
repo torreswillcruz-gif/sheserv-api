@@ -15,6 +15,10 @@ services:
         generateValue: true
       - key: DATA_ENCRYPTION_KEY
         generateValue: true
+      # JSON da conta de serviço do Firebase (push). Sem ela, o push fica
+      # desligado e os avisos ficam só no sino do app.
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
   - type: web
     name: sheserve-admin-api
     runtime: node

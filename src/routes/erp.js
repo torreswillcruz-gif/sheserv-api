@@ -62,23 +62,6 @@ erpRouter.patch("/me/plan", asyncHandler(async (request, response) => {
   throw new ApiError(403, "plan_change_not_allowed", "Plan changes require verified payment or administrator approval.");
 }));
 
-erpRouter.get("/me/notifications", asyncHandler(async (request, response) => {
-  const { rows } = await runQuery(
-    `SELECT id,type,title,body,read,created_at AS "createdAt"
-     FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
-    [request.user.id]
-  );
-  response.json(rows);
-}));
-
-erpRouter.patch("/me/notifications/:id/read", asyncHandler(async (request, response) => {
-  const { rows } = await runQuery(
-    "UPDATE notifications SET read=true WHERE id=$1 AND user_id=$2 RETURNING id,read",
-    [request.params.id, request.user.id]
-  );
-  if (!rows[0]) throw new ApiError(404, "not_found", "Notification not found.");
-  response.json(rows[0]);
-}));
 
 const financialPeriodSchema = z.enum(["week", "month", "quarter", "year"]);
 

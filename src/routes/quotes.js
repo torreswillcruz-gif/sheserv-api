@@ -6,6 +6,7 @@ const { ApiError, asyncHandler } = require("../errors");
 const { requireRole } = require("../security");
 const { assertBookableDate, assertSlotFree, slotsForDay } = require("../schedule");
 const { isValidUuid } = require("../validation");
+const { formatMoney, notify, userName } = require("../notifications");
 
 // Orçamentos que ainda podem ser aprovados, recusados ou negociados
 const NEGOTIABLE_QUOTE_STATUSES = ["open", "countered"];
@@ -66,16 +67,30 @@ quotesRouter.post("/requests", requireRole("cliente"), asyncHandler(async (reque
     );
     if (!rows[0]) throw new ApiError(404, "not_found", "Provider not found.");
   }
-  const { rows } = await runQuery(
-    `INSERT INTO service_requests
-      (customer_id,provider_id,service_id,description,brief_answers,photo_urls,address_id,date_window_start,date_window_end,estimated_value,expires_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-    [request.user.id, data.providerId ?? null, data.serviceId ?? null, data.description,
-     JSON.stringify(data.briefAnswers), data.photoUrls, data.addressId ?? null,
-     data.dateWindowStart ?? null, data.dateWindowEnd ?? null,
-     data.estimatedValue ?? null, expiresAt]
-  );
-  response.status(201).json(rows[0]);
+  const created = await runInTransaction(async (transaction) => {
+    const { rows } = await transaction.query(
+      `INSERT INTO service_requests
+        (customer_id,provider_id,service_id,description,brief_answers,photo_urls,address_id,date_window_start,date_window_end,estimated_value,expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [request.user.id, data.providerId ?? null, data.serviceId ?? null, data.description,
+       JSON.stringify(data.briefAnswers), data.photoUrls, data.addressId ?? null,
+       data.dateWindowStart ?? null, data.dateWindowEnd ?? null,
+       data.estimatedValue ?? null, expiresAt]
+    );
+    // Pedido direto: avisa a prestadora escolhida (pedidos públicos não notificam ninguém)
+    if (data.providerId) {
+      await notify(transaction, {
+        userId: data.providerId,
+        type: "request_received",
+        title: "Nova solicitação de orçamento",
+        body: `${await userName(transaction, request.user.id)} pediu um orçamento para você.`,
+        data: { requestId: rows[0].id },
+        area: "provider",
+      });
+    }
+    return rows[0];
+  });
+  response.status(201).json(created);
 }));
 
 // Quem tem os dois papéis escolhe a visão com ?as=customer|provider.
@@ -204,6 +219,14 @@ quotesRouter.post("/requests/:id/quotes", requireRole("prestadora"), asyncHandle
       "INSERT INTO quote_events (quote_id,actor_id,type,data) VALUES ($1,$2,'sent',$3)",
       [quote.id, request.user.id, { reservedQuota: true }]
     );
+    await notify(transaction, {
+      userId: serviceRequest.customer_id,
+      type: "quote_received",
+      title: "Você recebeu um orçamento",
+      body: `${await userName(transaction, request.user.id)} enviou um orçamento de ${formatMoney(data.totalAmount)}.`,
+      data: { requestId: serviceRequest.id, quoteId: quote.id },
+      area: "customer",
+    });
     return quote;
   });
   response.status(201).json(created);
@@ -339,13 +362,30 @@ quotesRouter.post("/quotes/:id/approve", requireRole("cliente"), asyncHandler(as
        FOR UPDATE`,
       [quote.request_id, quote.id, NEGOTIABLE_QUOTE_STATUSES]
     );
+    const customerName = await userName(transaction, request.user.id);
     for (const competingQuote of competingQuotes) {
       await transaction.query(
         "UPDATE quotes SET status='rejected',updated_at=now() WHERE id=$1",
         [competingQuote.id]
       );
       await releaseReservedQuota(transaction, competingQuote);
+      await notify(transaction, {
+        userId: competingQuote.provider_id,
+        type: "quote_not_chosen",
+        title: "Orçamento não escolhido",
+        body: `${customerName} escolheu outra proposta. A unidade da sua cota foi devolvida.`,
+        data: { requestId: quote.request_id, quoteId: competingQuote.id },
+        area: "provider",
+      });
     }
+    await notify(transaction, {
+      userId: quote.provider_id,
+      type: "quote_approved",
+      title: "Orçamento aprovado!",
+      body: `${customerName} aprovou seu orçamento de ${formatMoney(quote.total_amount)} e agendou o serviço.`,
+      data: { requestId: quote.request_id, quoteId: quote.id, orderId },
+      area: "provider",
+    });
 
     await transaction.query(
       "UPDATE service_requests SET status='accepted',provider_id=$2,updated_at=now() WHERE id=$1",
@@ -374,8 +414,17 @@ quotesRouter.get("/requests/:id/quotes", asyncHandler(async (request, response) 
   );
   const serviceRequest = requestRows[0];
   if (!serviceRequest) throw new ApiError(404, "not_found", "Request not found.");
-  if (serviceRequest.customer_id !== request.user.id && serviceRequest.provider_id !== request.user.id)
-    throw new ApiError(403, "forbidden", "Not a participant of this request.");
+  // A cliente vê todos os orçamentos da solicitação; a prestadora, só os dela
+  // (inclusive em pedido público, em que provider_id ainda é nulo). Antes, só a
+  // prestadora do pedido direto entrava, e via também os orçamentos das outras.
+  const isCustomer = serviceRequest.customer_id === request.user.id;
+  if (!isCustomer) {
+    const { rows: ownQuotes } = await runQuery(
+      "SELECT 1 FROM quotes WHERE request_id=$1 AND provider_id=$2 LIMIT 1",
+      [request.params.id, request.user.id]
+    );
+    if (!ownQuotes[0]) throw new ApiError(403, "forbidden", "Not a participant of this request.");
+  }
   const { rows } = await runQuery(
     `SELECT q.*,
       provider.name AS "providerName",
@@ -385,9 +434,9 @@ quotesRouter.get("/requests/:id/quotes", asyncHandler(async (request, response) 
       ) ORDER BY qi.created_at) FROM quote_items qi WHERE qi.quote_id=q.id) AS items
      FROM quotes q
      JOIN users provider ON provider.id=q.provider_id
-     WHERE q.request_id=$1
+     WHERE q.request_id=$1 AND ($2::uuid IS NULL OR q.provider_id=$2)
      ORDER BY q.created_at DESC`,
-    [request.params.id]
+    [request.params.id, isCustomer ? null : request.user.id]
   );
   response.json(rows);
 }));
@@ -433,12 +482,24 @@ quotesRouter.post("/quotes/:id/messages", asyncHandler(async (request, response)
   if (!quote) throw new ApiError(404, "not_found", "Quote not found.");
   if (quote.customer_id !== request.user.id && quote.provider_id !== request.user.id)
     throw new ApiError(403, "forbidden", "Not a participant of this quote.");
-  const { rows } = await runQuery(
-    `INSERT INTO quote_messages (quote_id,author_id,text)
-     VALUES ($1,$2,$3) RETURNING id,text,author_id AS "authorId",created_at AS "createdAt"`,
-    [quote.id, request.user.id, data.text]
-  );
-  response.status(201).json(rows[0]);
+  const message = await runInTransaction(async (transaction) => {
+    const { rows } = await transaction.query(
+      `INSERT INTO quote_messages (quote_id,author_id,text)
+       VALUES ($1,$2,$3) RETURNING id,text,author_id AS "authorId",created_at AS "createdAt"`,
+      [quote.id, request.user.id, data.text]
+    );
+    const fromCustomer = quote.customer_id === request.user.id;
+    await notify(transaction, {
+      userId: fromCustomer ? quote.provider_id : quote.customer_id,
+      type: "quote_message",
+      title: `Nova mensagem de ${await userName(transaction, request.user.id)}`,
+      body: data.text.length > 120 ? `${data.text.slice(0, 117)}...` : data.text,
+      data: { requestId: quote.request_id, quoteId: quote.id },
+      area: fromCustomer ? "provider" : "customer",
+    });
+    return rows[0];
+  });
+  response.status(201).json(message);
 }));
 
 quotesRouter.post("/quotes/:id/counter", asyncHandler(async (request, response) => {
@@ -467,6 +528,16 @@ quotesRouter.post("/quotes/:id/counter", asyncHandler(async (request, response) 
       "UPDATE quotes SET status='countered',total_amount=$2,valid_until=$3,terms=$4,updated_at=now() WHERE id=$1",
       [quote.id, data.totalAmount, data.validUntil, data.terms ?? null]
     );
+    const fromCustomer = quote.customer_id === request.user.id;
+    const author = await userName(transaction, request.user.id);
+    await notify(transaction, {
+      userId: fromCustomer ? quote.provider_id : quote.customer_id,
+      type: "quote_countered",
+      title: fromCustomer ? "Contraproposta recebida" : "Proposta atualizada",
+      body: `${author} propôs ${formatMoney(data.totalAmount)}.`,
+      data: { requestId: quote.request_id, quoteId: quote.id },
+      area: fromCustomer ? "provider" : "customer",
+    });
     const { rows: updated } = await transaction.query("SELECT * FROM quotes WHERE id=$1", [quote.id]);
     return updated[0];
   });
@@ -484,6 +555,14 @@ quotesRouter.post("/quotes/:id/reject", requireRole("cliente"), asyncHandler(asy
 
     await transaction.query("UPDATE quotes SET status='rejected',updated_at=now() WHERE id=$1", [quote.id]);
     await releaseReservedQuota(transaction, quote);
+    await notify(transaction, {
+      userId: quote.provider_id,
+      type: "quote_rejected",
+      title: "Orçamento recusado",
+      body: `${await userName(transaction, request.user.id)} recusou seu orçamento de ${formatMoney(quote.total_amount)}. A unidade da sua cota foi devolvida.`,
+      data: { requestId: quote.request_id, quoteId: quote.id },
+      area: "provider",
+    });
     return quote.id;
   });
   response.json({ id: rejectedQuoteId, status: "rejected" });

@@ -12,6 +12,7 @@ const {
   assertWithinAvailability,
   slotsForDay,
 } = require("../schedule");
+const { formatWhen, notify, userName } = require("../notifications");
 
 const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 
@@ -163,6 +164,14 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
       "INSERT INTO order_events (order_id,actor_id,type) VALUES ($1,$2,'requested')",
       [insertedOrder.id, request.user.id]
     );
+    await notify(transactionClient, {
+      userId: service.provider_id,
+      type: "order_requested",
+      title: "Novo pedido",
+      body: `${await userName(transactionClient, request.user.id)} agendou ${service.title} para ${formatWhen(scheduledDate)}.`,
+      data: { orderId: insertedOrder.id },
+      area: "provider",
+    });
     return insertedOrder;
   });
 
@@ -272,6 +281,38 @@ function allowedActorForTransition(order, nextStatus) {
   return ORDER_STATUS_TRANSITIONS[order.status]?.[nextStatus];
 }
 
+// Avisa a outra parte de cada mudança de status do pedido (sino e push).
+// cliente recebe: aceito, a caminho (prestadora indo até ela), iniciado,
+// concluído; prestadora recebe: cliente a caminho (atendimento no espaço dela);
+// as duas recebem cancelamento e contestação feitos pela outra.
+async function notifyOrderStatus(transactionClient, order, nextStatus, actingUserId) {
+  const actorIsCustomer = actingUserId === order.customer_id;
+  const recipientId = actorIsCustomer ? order.provider_id : order.customer_id;
+  const area = actorIsCustomer ? "provider" : "customer";
+  const actor = await userName(transactionClient, actingUserId);
+  const when = formatWhen(order.scheduled_at);
+  const messages = {
+    accepted: ["Pedido aceito", `${actor} aceitou seu pedido para ${when}.`],
+    on_the_way: actorIsCustomer
+      ? [`${actor} está a caminho`, `A cliente saiu para o atendimento de ${when}.`]
+      : ["A prestadora está a caminho", `${actor} saiu para o seu atendimento de ${when}.`],
+    in_progress: ["Atendimento iniciado", `${actor} iniciou o atendimento.`],
+    completed: ["Atendimento concluído", `Conte como foi: avalie o atendimento de ${actor}.`],
+    cancelled: ["Pedido cancelado", `${actor} cancelou o pedido de ${when}.`],
+    disputed: ["Pedido contestado", `${actor} abriu uma contestação sobre o pedido de ${when}.`],
+  };
+  const message = messages[nextStatus];
+  if (!message) return;
+  await notify(transactionClient, {
+    userId: recipientId,
+    type: `order_${nextStatus}`,
+    title: message[0],
+    body: message[1],
+    data: { orderId: order.id },
+    area,
+  });
+}
+
 async function applyStatusTransition(transactionClient, order, nextStatus, actingUserId, actingRole) {
   const allowedActor = allowedActorForTransition(order, nextStatus);
   if (!allowedActor || (allowedActor !== "any" && allowedActor !== actingRole))
@@ -282,6 +323,7 @@ async function applyStatusTransition(transactionClient, order, nextStatus, actin
     "INSERT INTO order_events (order_id,actor_id,type,data) VALUES ($1,$2,'status_changed',$3)",
     [order.id, actingUserId, { from: order.status, to: nextStatus }]
   );
+  await notifyOrderStatus(transactionClient, order, nextStatus, actingUserId);
 
   if (nextStatus === "completed") {
     await transactionClient.query("UPDATE payments SET status='captured' WHERE order_id=$1", [order.id]);

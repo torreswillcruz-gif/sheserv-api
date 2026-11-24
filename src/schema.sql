@@ -514,6 +514,21 @@ CREATE TABLE IF NOT EXISTS team_members (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
+
+-- Notificações com os ids do que mudou (requestId, quoteId, orderId) e a área
+-- a que pertencem (customer/provider; nula = as duas)
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS data jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS area text CHECK (area IN ('customer','provider'));
+
+-- Aparelhos que recebem push (token do Firebase Cloud Messaging)
+CREATE TABLE IF NOT EXISTS device_tokens (
+  token text PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  platform text NOT NULL DEFAULT 'android' CHECK (platform IN ('android','ios','web')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_financial_provider ON financial_entries(provider_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_provider_clients ON provider_clients(provider_id);
 
