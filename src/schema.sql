@@ -263,6 +263,9 @@ ALTER TABLE services ADD COLUMN IF NOT EXISTS price_type text NOT NULL DEFAULT '
 ALTER TABLE services ADD COLUMN IF NOT EXISTS accepts_quotes boolean NOT NULL DEFAULT false;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS briefing_questions jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS cancellation_policy text;
+-- Horário de atendimento: [{weekday 1-7 (ISO), start "HH:MM", end "HH:MM"}] no horário de Brasília.
+-- Vazio = serviço antigo, sem restrição (obrigatório para serviços novos; ver src/schedule.js).
+ALTER TABLE services ADD COLUMN IF NOT EXISTS availability jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS quote_id uuid;
 
 CREATE TABLE IF NOT EXISTS plan_catalog (

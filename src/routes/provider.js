@@ -2,6 +2,7 @@ const providerRouter = require("express").Router();
 const { z } = require("zod");
 const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
+const { availabilitySchema } = require("../schedule");
 const { isValidUuid } = require("../validation");
 
 const ORDER_STATUSES = ["requested", "accepted", "on_the_way", "in_progress", "completed", "cancelled", "disputed"];
@@ -213,7 +214,8 @@ const SERVICE_COLUMNS = `id, category_id AS "categoryId",
   (SELECT name FROM categories WHERE categories.id = services.category_id) AS "categoryName", title, base_price::float AS "basePrice",
   duration_minutes AS "durationMinutes", service_location AS "serviceLocation",
   price_type AS "priceType", accepts_quotes AS "acceptsQuotes",
-  briefing_questions AS "briefingQuestions", cancellation_policy AS "cancellationPolicy", active`;
+  briefing_questions AS "briefingQuestions", cancellation_policy AS "cancellationPolicy",
+  availability, active`;
 
 const serviceSchema = z.object({
   categoryId: z.string().min(1).max(100),
@@ -226,6 +228,8 @@ const serviceSchema = z.object({
   acceptsQuotes: z.boolean().default(false),
   briefingQuestions: z.array(z.string().trim().min(2).max(300)).max(30).default([]),
   cancellationPolicy: z.string().trim().max(1000).nullable().optional(),
+  // Obrigatório ao cadastrar; ver src/schedule.js
+  availability: availabilitySchema,
 }).strict();
 
 // campo enviado pelo app -> coluna do banco
@@ -239,6 +243,7 @@ const SERVICE_FIELD_TO_COLUMN = {
   acceptsQuotes: "accepts_quotes",
   briefingQuestions: "briefing_questions",
   cancellationPolicy: "cancellation_policy",
+  availability: "availability",
 };
 
 async function assertCategoryExists(categoryId) {
@@ -285,11 +290,12 @@ providerRouter.post("/me/services", asyncHandler(async (request, response) => {
 
   // provider_id vem sempre do token
   const { rows: createdServices } = await runQuery(
-    `INSERT INTO services (provider_id, category_id, title, base_price, duration_minutes, service_location, price_type, accepts_quotes, briefing_questions, cancellation_policy)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING ${SERVICE_COLUMNS}`,
+    `INSERT INTO services (provider_id, category_id, title, base_price, duration_minutes, service_location, price_type, accepts_quotes, briefing_questions, cancellation_policy, availability)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING ${SERVICE_COLUMNS}`,
     [request.user.id, serviceData.categoryId, serviceData.title, serviceData.basePrice,
      serviceData.durationMinutes, serviceData.serviceLocation, serviceData.priceType,
-     serviceData.acceptsQuotes, JSON.stringify(serviceData.briefingQuestions), serviceData.cancellationPolicy ?? null]
+     serviceData.acceptsQuotes, JSON.stringify(serviceData.briefingQuestions), serviceData.cancellationPolicy ?? null,
+     JSON.stringify(serviceData.availability)]
   );
   response.status(201).json(createdServices[0]);
 }));
@@ -321,7 +327,7 @@ providerRouter.patch("/me/services/:id", asyncHandler(async (request, response) 
   // $1 = id do serviço, $2 = prestadora dona; os campos alterados começam no $3
   const columnAssignments = changedFields.map(([fieldName], position) => `${SERVICE_FIELD_TO_COLUMN[fieldName]}=$${position + 3}`);
   const changedValues = changedFields.map(([fieldName, fieldValue]) =>
-    fieldName === "briefingQuestions" ? JSON.stringify(fieldValue) : fieldValue
+    fieldName === "briefingQuestions" || fieldName === "availability" ? JSON.stringify(fieldValue) : fieldValue
   );
   const { rows: updatedServices } = await runQuery(
     `UPDATE services SET ${columnAssignments.join(", ")} WHERE id=$1 AND provider_id=$2 AND active RETURNING ${SERVICE_COLUMNS}`,

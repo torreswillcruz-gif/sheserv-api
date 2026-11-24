@@ -4,6 +4,7 @@ const { z } = require("zod");
 const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
 const { requireRole } = require("../security");
+const { assertSlotFree } = require("../schedule");
 
 // Orçamentos que ainda podem ser aprovados, recusados ou negociados
 const NEGOTIABLE_QUOTE_STATUSES = ["open", "countered"];
@@ -256,17 +257,15 @@ quotesRouter.post("/quotes/:id/approve", requireRole("cliente"), asyncHandler(as
     if (!approval.addressId && service?.service_location === "at_customer" && !serviceRequest.address_id)
       throw new ApiError(422, "validation_error", "Address is required.", { addressId: "Select an address." });
 
+    // O horário é negociado no orçamento, então não se aplica o horário de atendimento
+    // do serviço; só se garante que a prestadora e a cliente estão livres.
     const durationMinutes = service?.duration_minutes ?? 60;
-    const endAt = new Date(scheduledAt.getTime() + durationMinutes * 60000);
-    const { rows: conflicts } = await transaction.query(
-      `SELECT 1 FROM orders
-       WHERE provider_id=$1 AND status IN ('requested','accepted','on_the_way','in_progress')
-         AND $2 < scheduled_at + duration_minutes * interval '1 minute'
-         AND $3 > scheduled_at`,
-      [quote.provider_id, scheduledAt, endAt]
-    );
-    if (conflicts[0])
-      throw new ApiError(409, "conflict", "Slot unavailable.", { scheduledAt: "The selected time is no longer available." });
+    const endAt = await assertSlotFree(transaction, {
+      providerId: quote.provider_id,
+      customerId: request.user.id,
+      start: scheduledAt,
+      durationMinutes,
+    });
 
     const addressId = serviceRequest.address_id ?? approval.addressId ?? null;
     const checkinCode = String(crypto.randomInt(0, 10000)).padStart(4, "0");

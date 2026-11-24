@@ -116,7 +116,8 @@ const PROVIDER_SELECT_SQL = `
         'priceType', listed_service.price_type,
         'acceptsQuotes', listed_service.accepts_quotes,
         'briefingQuestions', listed_service.briefing_questions,
-        'cancellationPolicy', listed_service.cancellation_policy
+        'cancellationPolicy', listed_service.cancellation_policy,
+        'availability', listed_service.availability
       ))
       FROM services listed_service
       JOIN categories service_category ON service_category.id = listed_service.category_id

@@ -5,6 +5,13 @@ const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
 const { requireRole } = require("../security");
 const { isValidUuid } = require("../validation");
+const {
+  ACTIVE_ORDER_STATUSES,
+  assertBookableDate,
+  assertSlotFree,
+  assertWithinAvailability,
+  slotsForDay,
+} = require("../schedule");
 
 const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 
@@ -123,16 +130,15 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
       customerAddressId = orderRequest.addressId;
     }
 
-    // A prestadora não pode ter dois pedidos ativos no mesmo horário
-    const serviceEndDate = new Date(scheduledDate.getTime() + service.duration_minutes * 60000);
-    const { rows: conflictingOrders } = await transactionClient.query(
-      `SELECT 1 FROM orders
-       WHERE provider_id=$1 AND status IN ('requested','accepted','on_the_way','in_progress')
-         AND $2 < scheduled_at + duration_minutes * interval '1 minute' AND $3 > scheduled_at`,
-      [service.provider_id, scheduledDate, serviceEndDate]
-    );
-    if (conflictingOrders[0])
-      throw new ApiError(409, "conflict", "Slot unavailable.", { scheduledAt: "The selected time is no longer available." });
+    // O horário precisa caber no horário de atendimento do serviço, a prestadora
+    // não pode ter outro pedido ativo nele e a cliente não pode ter outro compromisso
+    assertWithinAvailability(service.availability, scheduledDate, service.duration_minutes);
+    const serviceEndDate = await assertSlotFree(transactionClient, {
+      providerId: service.provider_id,
+      customerId: request.user.id,
+      start: scheduledDate,
+      durationMinutes: service.duration_minutes,
+    });
 
     // Preço calculado pelo servidor; não há comissão da plataforma.
     const basePrice = Number(service.base_price);
@@ -166,15 +172,76 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
 
 // ---------- Ler pedidos ----------
 
+// Agenda de cada área: ?as=customer (pedidos que a pessoa contratou) ou
+// ?as=provider (pedidos que ela atende). Sem "as", devolve os dois (compatibilidade).
+const agendaQuerySchema = z.object({ as: z.enum(["customer", "provider"]).optional() }).strict();
+const AGENDA_ROLE = { customer: "cliente", provider: "prestadora" };
+
+function agendaView(request) {
+  const { as: view } = agendaQuerySchema.parse(request.query);
+  if (view && !(request.user.roles ?? []).includes(AGENDA_ROLE[view]))
+    throw new ApiError(403, "forbidden", `Requires role ${AGENDA_ROLE[view]}.`);
+  return view;
+}
+
 ordersRouter.get("/me/orders", asyncHandler(async (request, response) => {
+  const view = agendaView(request);
+  const filter = view === "customer"
+    ? "orders.customer_id = $1"
+    : view === "provider"
+      ? "orders.provider_id = $1"
+      : "(orders.customer_id = $1 OR orders.provider_id = $1)";
   const { rows: myOrders } = await runQuery(
     `${ORDER_SELECT_SQL}
-     WHERE orders.customer_id = $1 OR orders.provider_id = $1
+     WHERE ${filter}
      ORDER BY orders.scheduled_at DESC
      LIMIT 100`,
     [request.user.id]
   );
   response.json(myOrders);
+}));
+
+// Compromissos da OUTRA área, só como "ocupado": sem nomes, endereço, valor ou id.
+// Ex.: ?as=customer devolve os atendimentos que a pessoa faz como prestadora.
+ordersRouter.get("/me/orders/busy", asyncHandler(async (request, response) => {
+  const { as: view } = z.object({ as: z.enum(["customer", "provider"]) }).strict().parse(request.query);
+  const otherSide = view === "customer" ? "provider_id" : "customer_id";
+  const { rows } = await runQuery(
+    `SELECT scheduled_at AS "scheduledAt", duration_minutes AS "durationMinutes", status
+     FROM orders
+     WHERE ${otherSide} = $1 AND status = ANY($2::text[])
+     ORDER BY scheduled_at
+     LIMIT 200`,
+    [request.user.id, ACTIVE_ORDER_STATUSES]
+  );
+  response.json(rows);
+}));
+
+// Horários de um serviço num dia (horário de Brasília), para a tela de agendar.
+// Cada horário vem com available=false quando a prestadora já tem pedido nele
+// (reason "provider_busy") ou quando a própria pessoa tem compromisso (reason "your_commitment").
+ordersRouter.get("/services/:id/slots", asyncHandler(async (request, response) => {
+  if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Service not found.");
+  const { date } = z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict().parse(request.query);
+  assertBookableDate(date);
+
+  const { rows: services } = await runQuery(
+    `SELECT service.id, service.provider_id, service.duration_minutes, service.availability
+     FROM services service
+     JOIN provider_profiles provider_profile ON provider_profile.user_id = service.provider_id
+     WHERE service.id = $1 AND service.active AND provider_profile.activation_status = 'active'`,
+    [request.params.id]
+  );
+  const service = services[0];
+  if (!service) throw new ApiError(404, "not_found", "Service not available.");
+
+  const { windows, slots } = await slotsForDay({ query: runQuery }, { service, dateKey: date, customerId: request.user.id });
+  response.json({
+    date,
+    durationMinutes: service.duration_minutes,
+    hours: windows.map(({ start, end }) => ({ start, end })),
+    slots,
+  });
 }));
 
 ordersRouter.get("/orders/:id", asyncHandler(async (request, response) => {
