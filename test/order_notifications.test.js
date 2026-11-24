@@ -141,3 +141,51 @@ describe("devices for push", () => {
     assert.equal(response.status, 422);
   });
 });
+
+describe("order chat", () => {
+  const send = (user, text) => server.call("POST", `/api/v1/orders/${ORDER_ID}/messages`, { ...user, body: { text } });
+
+  test("a message notifies the other side and hides phone numbers", async () => {
+    resetDatabase([
+      names,
+      { pattern: /^SELECT \* FROM orders WHERE id=\$1 FOR UPDATE/, rows: () => [order] },
+      { pattern: /^INSERT INTO messages/, rows: (params) => [{ id: "m1", authorId: params[1], text: params[2] }] },
+    ]);
+    const response = await send(customer, "Me liga no 11 98765-4321, por favor");
+    assert.equal(response.status, 201);
+    assert.equal(response.body.text, "Me liga no [telefone oculto], por favor");
+    assert.equal(response.body.authorName, "Ana Lima");
+    assert.deepEqual(notifications(), [{
+      userId: PROVIDER_ID, type: "order_message", title: "Nova mensagem de Ana Lima",
+      body: "Me liga no [telefone oculto], por favor", data: { orderId: ORDER_ID }, area: "provider",
+    }]);
+  });
+
+  test("the provider's message goes to the customer area", async () => {
+    resetDatabase([
+      names,
+      { pattern: /^SELECT \* FROM orders WHERE id=\$1 FOR UPDATE/, rows: () => [order] },
+      { pattern: /^INSERT INTO messages/, rows: [{ id: "m2" }] },
+    ]);
+    await send(provider, "Chego às 10h");
+    assert.deepEqual(notifications().map(({ userId, area }) => [userId, area]), [[CUSTOMER_ID, "customer"]]);
+  });
+
+  test("completed or cancelled orders are read-only", async () => {
+    for (const status of ["completed", "cancelled"]) {
+      order.status = status;
+      resetDatabase([{ pattern: /^SELECT \* FROM orders WHERE id=\$1 FOR UPDATE/, rows: () => [order] }]);
+      const response = await send(customer, "Oi?");
+      assert.equal(response.status, 409);
+      assert.equal(response.body.error.code, "chat_closed");
+      assert.equal(queriesMatching(/^INSERT INTO messages/).length, 0);
+    }
+  });
+
+  test("lists the messages with the author's name", async () => {
+    resetDatabase([{ pattern: /^SELECT \* FROM orders WHERE id=\$1 FOR UPDATE/, rows: () => [order] }]);
+    const response = await server.call("GET", `/api/v1/orders/${ORDER_ID}/messages`, customer);
+    assert.equal(response.status, 200);
+    assert.match(queriesMatching(/FROM messages m JOIN users u/)[0].sql, /u\.name AS "authorName"/);
+  });
+});

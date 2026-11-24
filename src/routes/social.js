@@ -1,6 +1,7 @@
 const socialRouter = require("express").Router();
 const { z } = require("zod");
-const { runQuery } = require("../db");
+const { runQuery, runInTransaction } = require("../db");
+const { notify, userName } = require("../notifications");
 const { ApiError, asyncHandler } = require("../errors");
 const { loadOrderForParticipant } = require("./orders");
 
@@ -16,24 +17,47 @@ const getOtherParticipantId = (order, userId) =>
 socialRouter.get("/orders/:id/messages", asyncHandler(async (request, response) => {
   const order = await loadOrderForParticipant(request.params.id, request.user.id);
   const { rows: messages } = await runQuery(
-    `SELECT id, author_id AS "authorId", text, created_at AS "createdAt" FROM messages WHERE order_id=$1 ORDER BY created_at`,
+    `SELECT m.id, m.author_id AS "authorId", u.name AS "authorName", m.text, m.created_at AS "createdAt"
+     FROM messages m JOIN users u ON u.id = m.author_id
+     WHERE m.order_id=$1 ORDER BY m.created_at`,
     [order.id]
   );
   response.json(messages);
 }));
 
+// Pedido cancelado ou concluído: a conversa fica só para leitura.
+const CHAT_CLOSED_STATUSES = ["cancelled", "completed"];
+
 const sendMessageSchema = z.object({ text: z.string().trim().min(1).max(1000) }).strict();
 
 socialRouter.post("/orders/:id/messages", asyncHandler(async (request, response) => {
   const { text: messageText } = sendMessageSchema.parse(request.body);
-  const order = await loadOrderForParticipant(request.params.id, request.user.id);
 
-  const { rows: createdMessages } = await runQuery(
-    `INSERT INTO messages (order_id,author_id,text) VALUES ($1,$2,$3)
-     RETURNING id, author_id AS "authorId", text, created_at AS "createdAt"`,
-    [order.id, request.user.id, maskPhoneNumbers(messageText)]
-  );
-  response.status(201).json(createdMessages[0]);
+  const created = await runInTransaction(async (transaction) => {
+    const order = await loadOrderForParticipant(request.params.id, request.user.id, transaction);
+    if (CHAT_CLOSED_STATUSES.includes(order.status))
+      throw new ApiError(409, "chat_closed", "This order no longer accepts messages.");
+
+    const text = maskPhoneNumbers(messageText);
+    const author = await userName(transaction, request.user.id);
+    const { rows: createdMessages } = await transaction.query(
+      `INSERT INTO messages (order_id,author_id,text) VALUES ($1,$2,$3)
+       RETURNING id, author_id AS "authorId", text, created_at AS "createdAt"`,
+      [order.id, request.user.id, text]
+    );
+    // Avisa a outra parte (sino e push), na área em que ela participa do pedido
+    const fromCustomer = order.customer_id === request.user.id;
+    await notify(transaction, {
+      userId: getOtherParticipantId(order, request.user.id),
+      type: "order_message",
+      title: `Nova mensagem de ${author}`,
+      body: text.length > 120 ? `${text.slice(0, 117)}...` : text,
+      data: { orderId: order.id },
+      area: fromCustomer ? "provider" : "customer",
+    });
+    return { ...createdMessages[0], authorName: author };
+  });
+  response.status(201).json(created);
 }));
 
 // ---------- Denúncias ----------
