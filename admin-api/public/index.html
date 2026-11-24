@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>SheServe · Admin</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <!-- Login -->
+  <main id="login-view" class="login" hidden>
+    <form id="login-form" class="login-card" novalidate>
+      <p class="brand">SheServe <span>Admin</span></p>
+      <h1>Entrar no painel</h1>
+      <p class="muted">Use uma conta com acesso de administrador.</p>
+      <label>
+        E-mail
+        <input id="login-email" type="email" autocomplete="username" required>
+      </label>
+      <label>
+        Senha
+        <input id="login-password" type="password" autocomplete="current-password" required>
+      </label>
+      <p id="login-error" class="form-error" role="alert" hidden></p>
+      <button id="login-submit" type="submit" class="button primary">Entrar</button>
+    </form>
+  </main>
+
+  <!-- Painel -->
+  <div id="app-view" hidden>
+    <header class="topbar">
+      <p class="brand">SheServe <span>Admin</span></p>
+      <div class="topbar-user">
+        <span id="admin-name" class="muted"></span>
+        <button id="logout-button" type="button" class="button ghost">Sair</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <div class="page-head">
+        <div>
+          <h1>Aprovação de prestadoras</h1>
+          <p class="muted">Revise o perfil e os serviços antes de liberar a prestadora nas buscas.</p>
+        </div>
+        <button id="refresh-button" type="button" class="button ghost">Atualizar</button>
+      </div>
+
+      <nav class="tabs" aria-label="Filtrar por status">
+        <button type="button" class="tab" data-status="pending" aria-pressed="true">Pendentes</button>
+        <button type="button" class="tab" data-status="active" aria-pressed="false">Aprovadas</button>
+        <button type="button" class="tab" data-status="rejected" aria-pressed="false">Recusadas</button>
+      </nav>
+
+      <p id="list-status" class="muted" role="status"></p>
+      <section id="provider-list" class="provider-list" aria-live="polite"></section>
+      <div class="list-footer">
+        <button id="load-more" type="button" class="button ghost" hidden>Carregar mais</button>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <!-- Modelo de cartão de prestadora -->
+  <template id="provider-card-template">
+    <article class="card">
+      <div class="card-head">
+        <div>
+          <h2 class="card-name"></h2>
+          <p class="card-meta muted"></p>
+        </div>
+        <span class="badge"></span>
+      </div>
+      <dl class="card-contact">
+        <div><dt>E-mail</dt><dd class="card-email"></dd></div>
+        <div><dt>Telefone</dt><dd class="card-phone"></dd></div>
+        <div><dt>Identidade</dt><dd class="card-identity"></dd></div>
+      </dl>
+      <div class="card-section">
+        <h3>Sobre o trabalho</h3>
+        <p class="card-bio"></p>
+      </div>
+      <div class="card-section">
+        <h3 class="card-services-title"></h3>
+        <ul class="card-services"></ul>
+      </div>
+      <div class="card-actions">
+        <button type="button" class="button primary action-approve">Aprovar</button>
+        <button type="button" class="button danger-outline action-reject">Recusar</button>
+      </div>
+      <form class="reject-form" hidden>
+        <label>
+          Motivo da recusa (enviado à prestadora)
+          <textarea class="reject-reason" rows="3" maxlength="500" required></textarea>
+        </label>
+        <div class="card-actions">
+          <button type="submit" class="button danger">Confirmar recusa</button>
+          <button type="button" class="button ghost action-cancel">Cancelar</button>
+        </div>
+      </form>
+    </article>
+  </template>
+</body>
+</html>

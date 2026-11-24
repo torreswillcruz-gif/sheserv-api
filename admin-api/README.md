@@ -10,9 +10,26 @@ does not issue tokens, expose a public registration route, or grant admin roles.
    catalog exist.
 2. Set `DATABASE_URL`, `DATABASE_SSL`, and the same `JWT_SECRET` used by the
    marketplace API.
-3. Run `npm install`, then `npm start`.
+3. Set `MARKETPLACE_API_URL` to the marketplace API base URL (for example
+   `https://sheserv-api.onrender.com`; `http://api:3000` in Docker Compose).
+   The admin panel signs in through it.
+4. Run `npm install`, then `npm start`.
 
 The service listens on `PORT` (default `3001`) and exposes `GET /health`.
+
+## Admin panel
+
+Open `/admin/` on the admin service (for example `http://localhost:3001/admin/`)
+and sign in with an account that has the `admin` role. The panel lists
+providers by status (pending, approved, rejected) with their contact details,
+bio and active services, and lets the administrator approve or reject them
+(a reason is required to reject and is sent to the provider).
+
+Sign-in goes through `POST /api/v1/admin/session` (also `/refresh` and
+`/logout`), which forwards the credentials to the marketplace API and only
+returns the session when the account currently has the `admin` role. The
+admin API still does not issue tokens itself. The session is kept in the
+browser tab (`sessionStorage`) and ends when the tab is closed.
 
 ## Granting administrator access
 

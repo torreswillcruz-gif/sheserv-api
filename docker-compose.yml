@@ -45,6 +45,8 @@ services:
     environment:
       <<: *local-secrets
       PORT: "3001"
+      # login do painel (/admin) é repassado à API principal
+      MARKETPLACE_API_URL: http://api:3000
     ports:
       - "3001:3001"
     depends_on:

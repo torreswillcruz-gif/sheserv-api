@@ -58,7 +58,19 @@ adminRouter.get("/providers", asyncHandler(async (request, response) => {
     `SELECT provider_user.id,provider_user.name,provider_user.email,provider_user.phone,
        provider_user.created_at AS "createdAt",provider_profile.bio,
        provider_profile.activation_status AS "activationStatus",
-       provider_profile.verified AS "identityVerified"
+       provider_profile.verified AS "identityVerified",
+       COALESCE((
+         SELECT json_agg(json_build_object(
+           'title',offered.title,
+           'category',category.name,
+           'basePrice',offered.base_price::float,
+           'priceType',offered.price_type,
+           'serviceLocation',offered.service_location
+         ) ORDER BY offered.title)
+         FROM services offered
+         JOIN categories category ON category.id=offered.category_id
+         WHERE offered.provider_id=provider_user.id AND offered.active
+       ),'[]'::json) AS services
      FROM provider_profiles provider_profile
      JOIN users provider_user ON provider_user.id=provider_profile.user_id
      WHERE provider_user.roles @> ARRAY['prestadora']::text[]

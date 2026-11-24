@@ -30,3 +30,7 @@ services:
         value: "true"
       - key: JWT_SECRET
         sync: false
+      # URL pública da marketplace-api, usada pelo login do painel /admin
+      # (ex.: https://sheserv-api.onrender.com)
+      - key: MARKETPLACE_API_URL
+        sync: false
