@@ -372,6 +372,37 @@ erpRouter.post("/me/promotions", requirePlanFeature("promotions"), asyncHandler(
   response.status(201).json(rows[0]);
 }));
 
+// Ativa a assinatura: marca a compra como paga e troca o plano da prestadora.
+// Hoje é chamada direto pela rota de compra (sem gateway). Com o gateway, deve
+// ser chamada só quando o pagamento for confirmado (webhook), passando os dados
+// da transação em `payment`.
+async function activateSubscription(transaction, { providerId, purchaseId, planCode, payment = {} }) {
+  const { rows: plans } = await transaction.query(
+    "SELECT plan_code,monthly_approval_limit FROM plan_catalog WHERE plan_code=$1 AND active=true",
+    [planCode]
+  );
+  if (!plans[0]) throw new ApiError(404, "not_found", "Active plan not found.");
+
+  await transaction.query(
+    `UPDATE plan_purchases SET status='active',paid_at=now(),
+       gateway_provider=$2,gateway_transaction_id=$3,amount=$4
+     WHERE id=$1`,
+    [purchaseId, payment.provider ?? null, payment.transactionId ?? null, payment.amount ?? null]
+  );
+  // Mesmo upsert da atribuição de plano pelo admin (admin-api).
+  const { rows } = await transaction.query(
+    `INSERT INTO provider_plans (provider_id,plan_name,monthly_approval_limit,renewal_at,updated_at)
+     VALUES ($1,$2,$3,date_trunc('month',now()) + interval '1 month',now())
+     ON CONFLICT (provider_id) DO UPDATE SET
+       plan_name=EXCLUDED.plan_name,monthly_approval_limit=EXCLUDED.monthly_approval_limit,
+       renewal_at=EXCLUDED.renewal_at,updated_at=now()
+     RETURNING plan_name AS "planCode",monthly_approval_limit AS "monthlyApprovalLimit",
+       renewal_at AS "renewalAt"`,
+    [providerId, planCode, plans[0].monthly_approval_limit]
+  );
+  return rows[0];
+}
+
 erpRouter.post("/me/purchases", asyncHandler(async (request, response) => {
   const data = z.object({
     storeProductId: z.string().trim().min(1).max(200),
@@ -384,16 +415,61 @@ erpRouter.post("/me/purchases", asyncHandler(async (request, response) => {
       ? String(request.body.plan).trim().toLowerCase()
       : undefined,
   });
-  const { rows } = await runQuery(
-    `INSERT INTO plan_purchases
-       (provider_id,store_product_id,purchase_kind,quantity,plan_name,status)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [request.user.id, data.storeProductId, data.purchaseKind, data.quantity,
-     data.purchaseKind === "subscription" ? data.plan ?? null : null,
-     data.purchaseKind === "subscription" ? "pending" : "active"]
-  );
-  response.status(201).json(rows[0]);
+  const isSubscription = data.purchaseKind === "subscription";
+  if (isSubscription && !data.plan)
+    throw new ApiError(422, "validation_error", "Subscription purchases require a plan.", { plan: "required" });
+
+  const result = await runInTransaction(async (transaction) => {
+    const { rows } = await transaction.query(
+      `INSERT INTO plan_purchases
+         (provider_id,store_product_id,purchase_kind,quantity,plan_name,status)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [request.user.id, data.storeProductId, data.purchaseKind, data.quantity,
+       isSubscription ? data.plan : null,
+       isSubscription ? "pending" : "active"]
+    );
+    const purchase = rows[0];
+    if (!isSubscription) return { ...purchase };
+
+    // TODO(payment-gateway): integração com o Mercado Pago (Mercado Livre).
+    // Quando o gateway existir, este trecho deve:
+    //   1. Criar a cobrança/assinatura no gateway (ex.: POST /preapproval ou
+    //      /checkout/preferences), usando `purchase.id` como external_reference.
+    //   2. Gravar gateway_provider='mercado_pago' e gateway_transaction_id na compra.
+    //   3. Responder 201 com a compra ainda `pending` e o link de pagamento
+    //      (init_point) para o app abrir — SEM chamar activateSubscription aqui.
+    // A ativação passa para o webhook abaixo, depois que o gateway confirmar
+    // o pagamento (status "approved"/"authorized").
+    // Enquanto não há gateway, o plano é ativado direto:
+    const plan = await activateSubscription(transaction, {
+      providerId: request.user.id,
+      purchaseId: purchase.id,
+      planCode: data.plan,
+    });
+    return { ...purchase, status: "active", plan };
+  });
+
+  response.status(201).json(result);
 }));
+
+// TODO(payment-gateway): webhook de confirmação do Mercado Pago.
+// Rota pública (sem requireRole/JWT; montar FORA do erpRouter, que exige
+// a role prestadora), validando a assinatura do header `x-signature` com o
+// segredo do webhook antes de confiar no corpo. Esboço:
+//
+// webhookRouter.post("/payments/mercado-pago/webhook", asyncHandler(async (request, response) => {
+//   // 1. Validar x-signature; buscar o pagamento na API do Mercado Pago pelo id
+//   //    recebido (nunca confiar só no corpo do webhook).
+//   // 2. Se aprovado: localizar a compra por external_reference (= plan_purchases.id),
+//   //    ignorar se já estiver 'active' (webhooks são reenviados) e chamar:
+//   //    await runInTransaction((transaction) => activateSubscription(transaction, {
+//   //      providerId: purchase.provider_id, purchaseId: purchase.id, planCode: purchase.plan_name,
+//   //      payment: { provider: "mercado_pago", transactionId: payment.id, amount: payment.transaction_amount },
+//   //    }));
+//   // 3. Se recusado/cancelado: UPDATE plan_purchases SET status='failed'.
+//   // 4. Responder 200 rápido para o gateway não reenviar.
+//   response.sendStatus(200);
+// }));
 
 erpRouter.get("/me/team", requirePlanFeature("team"), asyncHandler(async (request, response) => {
   const { rows } = await runQuery(
