@@ -246,8 +246,9 @@ const SERVICE_FIELD_TO_COLUMN = {
   availability: "availability",
 };
 
+// Serviço novo só em categoria ativa (desativada no painel admin = fora do app)
 async function assertCategoryExists(categoryId) {
-  const { rows: matchingCategories } = await runQuery("SELECT 1 FROM categories WHERE id=$1", [categoryId]);
+  const { rows: matchingCategories } = await runQuery("SELECT 1 FROM categories WHERE id=$1 AND active", [categoryId]);
   if (!matchingCategories[0])
     throw new ApiError(422, "validation_error", "The request is invalid.", { categoryId: "Category not found." });
 }

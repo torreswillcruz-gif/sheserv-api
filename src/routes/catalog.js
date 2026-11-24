@@ -6,16 +6,20 @@ const { isValidUuid } = require("../validation");
 
 // ---------- Categorias ----------
 
+// Só as categorias ativas, na ordem definida no painel admin (depois, por nome).
+// `icon` é a chave do ícone que o app desenha.
+const CATEGORY_COLUMNS = 'id, parent_id AS "parentId", name, icon';
+
 catalogRouter.get("/categories", asyncHandler(async (request, response) => {
   const { parentId } = z.object({ parentId: z.string().optional() }).parse(request.query);
 
   const { rows: categories } = parentId
     ? await runQuery(
-        'SELECT id, parent_id AS "parentId", name FROM categories WHERE parent_id=$1 ORDER BY name',
+        `SELECT ${CATEGORY_COLUMNS} FROM categories WHERE parent_id=$1 AND active ORDER BY sort_order, name`,
         [parentId]
       )
     : await runQuery(
-        'SELECT id, parent_id AS "parentId", name FROM categories WHERE parent_id IS NULL ORDER BY name'
+        `SELECT ${CATEGORY_COLUMNS} FROM categories WHERE parent_id IS NULL AND active ORDER BY sort_order, name`
       );
   response.json(categories);
 }));

@@ -311,6 +311,147 @@ adminRouter.patch("/providers/:id/plan", asyncHandler(async (request, response) 
   response.json(result);
 }));
 
+// ---------- Categorias ----------
+//
+// Mantidas pelo admin: o app lista só as ativas, na ordem `sortOrder`.
+// Dois níveis: categoria principal e subcategoria (de uma principal).
+// Excluir só quando nada usa a categoria; com serviços, desative.
+
+// Chaves de ícone que o app sabe desenhar (ServiceCategoryTile no app).
+const CATEGORY_ICONS = [
+  "general", "cleaning", "beauty", "fashion", "cooking", "learning",
+  "repairs", "care", "pets", "health", "events", "transport",
+];
+
+const categoryIdSchema = z.string().trim().min(2).max(40)
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Use letras minúsculas, números e hífens (ex.: limpeza-pos-obra).");
+
+const categoryFields = {
+  name: z.string().trim().min(2).max(60),
+  parentId: categoryIdSchema.nullable().default(null),
+  icon: z.enum(CATEGORY_ICONS).default("general"),
+  sortOrder: z.number().int().min(0).max(9999).default(0),
+  active: z.boolean().default(true),
+};
+const categoryCreateSchema = z.object({ id: categoryIdSchema, ...categoryFields }).strict();
+const categoryUpdateSchema = z.object(categoryFields).strict();
+
+const CATEGORY_RETURNING = `id,parent_id AS "parentId",name,icon,active,
+  sort_order AS "sortOrder",updated_at AS "updatedAt"`;
+
+function categoryError(field, message) {
+  return new ApiError(422, "validation_error", "The request is invalid.", { [field]: message });
+}
+
+// A categoria acima precisa existir e ser principal; quem tem subcategorias
+// não pode virar subcategoria (só dois níveis).
+async function assertValidParent(transaction, parentId, categoryId) {
+  if (parentId === null) return;
+  if (parentId === categoryId) {
+    throw categoryError("parentId", "Uma categoria não pode ficar dentro dela mesma.");
+  }
+  const { rows: parents } = await transaction.query("SELECT parent_id FROM categories WHERE id=$1", [parentId]);
+  if (!parents[0]) throw categoryError("parentId", "Categoria principal não encontrada.");
+  if (parents[0].parent_id !== null) {
+    throw categoryError("parentId", "Escolha uma categoria principal (sem outra acima dela).");
+  }
+  const { rows: children } = await transaction.query(
+    "SELECT count(*)::int AS total FROM categories WHERE parent_id=$1",
+    [categoryId]
+  );
+  if (children[0]?.total > 0) {
+    throw categoryError("parentId", "Esta categoria tem subcategorias e não pode virar subcategoria.");
+  }
+}
+
+adminRouter.get("/categories", asyncHandler(async (_request, response) => {
+  const { rows } = await runQuery(
+    `SELECT category.id,category.parent_id AS "parentId",category.name,category.icon,category.active,
+       category.sort_order AS "sortOrder",category.updated_at AS "updatedAt",
+       (SELECT count(*)::int FROM services service WHERE service.category_id=category.id) AS "serviceCount",
+       (SELECT count(*)::int FROM services service
+        WHERE service.category_id=category.id AND service.active) AS "activeServiceCount",
+       (SELECT count(*)::int FROM categories child WHERE child.parent_id=category.id) AS "childCount"
+     FROM categories category
+     ORDER BY category.sort_order,category.name`
+  );
+  response.json({ items: rows, icons: CATEGORY_ICONS });
+}));
+
+adminRouter.post("/categories", asyncHandler(async (request, response) => {
+  const category = categoryCreateSchema.parse(request.body);
+  const created = await runInTransaction(async (transaction) => {
+    const { rows: existing } = await transaction.query("SELECT 1 FROM categories WHERE id=$1", [category.id]);
+    if (existing[0]) {
+      throw new ApiError(409, "category_exists", "Category already exists.", {
+        id: "Já existe uma categoria com esse identificador.",
+      });
+    }
+    await assertValidParent(transaction, category.parentId, category.id);
+    const { rows } = await transaction.query(
+      `INSERT INTO categories (id,parent_id,name,icon,sort_order,active,updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,now())
+       RETURNING ${CATEGORY_RETURNING}`,
+      [category.id, category.parentId, category.name, category.icon, category.sortOrder, category.active]
+    );
+    await recordAudit(transaction, request.user.id, "category.created", "category", category.id, rows[0]);
+    return rows[0];
+  });
+  response.status(201).json(created);
+}));
+
+adminRouter.put("/categories/:id", asyncHandler(async (request, response) => {
+  const categoryId = categoryIdSchema.parse(request.params.id);
+  const update = categoryUpdateSchema.parse(request.body);
+  const updated = await runInTransaction(async (transaction) => {
+    const { rows: existing } = await transaction.query(
+      `SELECT ${CATEGORY_RETURNING} FROM categories WHERE id=$1 FOR UPDATE`,
+      [categoryId]
+    );
+    if (!existing[0]) throw new ApiError(404, "not_found", "Category not found.");
+    await assertValidParent(transaction, update.parentId, categoryId);
+    const { rows } = await transaction.query(
+      `UPDATE categories SET parent_id=$2,name=$3,icon=$4,sort_order=$5,active=$6,updated_at=now()
+       WHERE id=$1
+       RETURNING ${CATEGORY_RETURNING}`,
+      [categoryId, update.parentId, update.name, update.icon, update.sortOrder, update.active]
+    );
+    await recordAudit(transaction, request.user.id, "category.updated", "category", categoryId, {
+      before: existing[0],
+      after: rows[0],
+    });
+    return rows[0];
+  });
+  response.json(updated);
+}));
+
+adminRouter.delete("/categories/:id", asyncHandler(async (request, response) => {
+  const categoryId = categoryIdSchema.parse(request.params.id);
+  await runInTransaction(async (transaction) => {
+    const { rows: existing } = await transaction.query(
+      `SELECT ${CATEGORY_RETURNING} FROM categories WHERE id=$1 FOR UPDATE`,
+      [categoryId]
+    );
+    if (!existing[0]) throw new ApiError(404, "not_found", "Category not found.");
+    const { rows: usage } = await transaction.query(
+      `SELECT (SELECT count(*)::int FROM services WHERE category_id=$1) AS services,
+         (SELECT count(*)::int FROM categories WHERE parent_id=$1) AS children`,
+      [categoryId]
+    );
+    // Serviços (mesmo inativos) e subcategorias apontam para a categoria
+    const { services = 0, children = 0 } = usage[0] ?? {};
+    if (services > 0 || children > 0) {
+      throw new ApiError(409, "category_in_use", "Category is in use.", {
+        services, children,
+        hint: "Desative a categoria em vez de excluir: ela some do app e os serviços continuam valendo.",
+      });
+    }
+    await transaction.query("DELETE FROM categories WHERE id=$1", [categoryId]);
+    await recordAudit(transaction, request.user.id, "category.deleted", "category", categoryId, existing[0]);
+  });
+  response.status(204).end();
+}));
+
 adminRouter.get("/audit-events", asyncHandler(async (request, response) => {
   const filters = auditQuerySchema.parse(request.query);
   const { rows } = await runQuery(

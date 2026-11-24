@@ -23,7 +23,9 @@ Open `/admin/` on the admin service (for example `http://localhost:3001/admin/`)
 and sign in with an account that has the `admin` role. The panel lists
 providers by status (pending, approved, rejected) with their contact details,
 bio and active services, and lets the administrator approve or reject them
-(a reason is required to reject and is sent to the provider).
+(a reason is required to reject and is sent to the provider). It also reviews
+identity verifications, edits the plan catalog and maintains the service
+categories (create, edit, order, activate/deactivate, delete when unused).
 
 Sign-in goes through `POST /api/v1/admin/session` (also `/refresh` and
 `/logout`), which forwards the credentials to the marketplace API and only
@@ -88,9 +90,25 @@ shape.
     `features`, and `active`.
 - `PATCH /api/v1/admin/providers/{providerId}/plan`
   - Body: `{"planCode":"premium"}`
+- `GET /api/v1/admin/categories`
+  - Every category with `serviceCount`, `activeServiceCount`, `childCount`,
+    and the accepted icon keys in `icons`.
+- `POST /api/v1/admin/categories`
+  - Body: `{"id":"banho-e-tosa","name":"Banho e tosa","icon":"pets",
+    "parentId":null,"sortOrder":0,"active":true}`. The id is a slug
+    (lowercase letters, digits, hyphens) and cannot change later.
+  - Two levels only: `parentId` must be a main category. `409 category_exists`.
+- `PUT /api/v1/admin/categories/{id}`
+  - Same fields except `id`. Deactivating hides the category in the app and
+    blocks new services in it; existing services keep working.
+- `DELETE /api/v1/admin/categories/{id}`
+  - Only when no service (even inactive) or subcategory uses it;
+    otherwise `409 category_in_use`.
+  - Icon keys live in `CATEGORY_ICONS` (`src/routes/admin.js`) and must also
+    exist in the app's `ServiceCategoryTile`.
 - `GET /api/v1/admin/audit-events?limit=50&offset=0`
 
-Every approval, plan edit, and assignment is written to
+Every approval, plan edit, assignment, and category change is written to
 `admin_audit_events`. The plan catalog is shared with the marketplace API.
 Monthly quote limits and the `finance`, `clients`, `statistics`, `promotions`,
 and `team` features are enforced by the API and reflected in the provider app.

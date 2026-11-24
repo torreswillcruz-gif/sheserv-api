@@ -36,6 +36,7 @@
         <button type="button" class="section-link" data-section="providers" aria-current="page">Prestadoras</button>
         <button type="button" class="section-link" data-section="verifications">Verificações</button>
         <button type="button" class="section-link" data-section="plans">Planos</button>
+        <button type="button" class="section-link" data-section="categories">Categorias</button>
       </nav>
       <div class="topbar-user">
         <span id="admin-name" class="muted"></span>
@@ -90,6 +91,20 @@
         </div>
         <button type="button" class="button ghost refresh-button">Atualizar</button>
       </div>
+      <p class="list-status muted" role="status"></p>
+      <section class="item-list plan-grid" aria-live="polite"></section>
+    </main>
+
+    <!-- Categorias -->
+    <main class="content" data-section-panel="categories" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Categorias de serviço</h1>
+          <p class="muted">Aparecem no app na ordem definida aqui. Desative para tirar uma categoria do app sem afetar os serviços que já a usam.</p>
+        </div>
+        <button type="button" class="button ghost refresh-button">Atualizar</button>
+      </div>
+      <section class="new-category"></section>
       <p class="list-status muted" role="status"></p>
       <section class="item-list plan-grid" aria-live="polite"></section>
     </main>
@@ -205,6 +220,53 @@
       </label>
       <div class="card-actions">
         <button type="submit" class="button primary">Salvar plano</button>
+      </div>
+    </form>
+  </template>
+
+  <!-- Modelo: categoria (nova ou existente) -->
+  <template id="category-form-template">
+    <form class="card category-card" novalidate>
+      <div class="card-head">
+        <div>
+          <h2 class="category-title"></h2>
+          <p class="card-meta muted category-meta"></p>
+        </div>
+        <div class="badges">
+          <span class="badge category-status"></span>
+        </div>
+      </div>
+      <label>
+        Nome
+        <input class="category-name" type="text" maxlength="60" required>
+      </label>
+      <label>
+        Identificador
+        <input class="category-id" type="text" maxlength="40" required>
+        <span class="hint">Letras minúsculas, números e hífens. Não muda depois de criado.</span>
+      </label>
+      <label>
+        Ícone no app
+        <select class="category-icon"></select>
+      </label>
+      <label>
+        Categoria principal
+        <select class="category-parent"></select>
+        <span class="hint">Deixe em "nenhuma" para uma categoria principal.</span>
+      </label>
+      <label>
+        Ordem de exibição
+        <input class="category-order" type="number" min="0" max="9999" step="1" value="0">
+        <span class="hint">Menor aparece primeiro; empates seguem o nome.</span>
+      </label>
+      <label class="check">
+        <input class="category-active" type="checkbox" checked>
+        Ativa (aparece no app e aceita serviços novos)
+      </label>
+      <p class="hint category-usage"></p>
+      <div class="card-actions">
+        <button type="submit" class="button primary category-save">Salvar categoria</button>
+        <button type="button" class="button danger-outline category-delete" hidden>Excluir</button>
       </div>
     </form>
   </template>

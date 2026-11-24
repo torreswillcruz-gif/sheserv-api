@@ -1,4 +1,4 @@
-// Painel administrativo SheServe: prestadoras, verificações e planos.
+// Painel administrativo SheServe: prestadoras, verificações, planos e categorias.
 // Fala só com a própria admin-api (mesma origem). Todo dado vindo da API é
 // inserido com textContent, nunca como HTML.
 (() => {
@@ -464,6 +464,198 @@
     return { load };
   }
 
+  // ---------- Categorias ----------
+
+  // Rótulos das chaves de ícone (a lista válida vem da API).
+  const CATEGORY_ICON_LABELS = {
+    general: "Geral",
+    cleaning: "Limpeza",
+    beauty: "Beleza",
+    fashion: "Moda e costura",
+    cooking: "Cozinha",
+    learning: "Aulas",
+    repairs: "Reparos",
+    care: "Cuidados",
+    pets: "Pets",
+    health: "Saúde e bem-estar",
+    events: "Eventos",
+    transport: "Transporte",
+  };
+  const CATEGORY_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+  // "Limpeza pós-obra" -> "limpeza-pos-obra"
+  function slugify(text) {
+    return text
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40);
+  }
+
+  function fillSelect(select, options, value) {
+    select.replaceChildren(...options.map(([optionValue, label]) => {
+      const option = document.createElement("option");
+      option.value = optionValue;
+      option.textContent = label;
+      return option;
+    }));
+    select.value = value;
+  }
+
+  function categoryErrorMessage(error) {
+    if (error.code === "category_exists") return "Já existe uma categoria com esse identificador.";
+    if (error.code === "category_in_use") return "A categoria está em uso. Desative-a em vez de excluir.";
+    return error.message;
+  }
+
+  function createCategoriesSection(panel) {
+    const list = $(".item-list", panel);
+    const status = $(".list-status", panel);
+    const newSlot = $(".new-category", panel);
+    const refreshButton = $(".refresh-button", panel);
+    let categories = [];
+    let icons = Object.keys(CATEGORY_ICON_LABELS);
+
+    const nameOf = (id) => categories.find((category) => category.id === id)?.name ?? id;
+
+    // `null` monta o formulário de criação.
+    function renderCategory(category) {
+      const form = cloneTemplate("category-form-template");
+      const isNew = category === null;
+      const nameInput = $(".category-name", form);
+      const idInput = $(".category-id", form);
+      const deleteButton = $(".category-delete", form);
+      // Só categorias principais podem receber subcategorias (dois níveis)
+      const roots = categories.filter((item) => item.parentId === null && item.id !== category?.id);
+
+      $(".category-title", form).textContent = isNew ? "Nova categoria" : category.name;
+      nameInput.value = category?.name ?? "";
+      idInput.value = category?.id ?? "";
+      idInput.disabled = !isNew;
+      fillSelect(
+        $(".category-icon", form),
+        icons.map((key) => [key, CATEGORY_ICON_LABELS[key] ?? key]),
+        category?.icon ?? "general",
+      );
+      fillSelect(
+        $(".category-parent", form),
+        [["", "— nenhuma —"], ...roots.map((root) => [root.id, root.name])],
+        category?.parentId ?? "",
+      );
+      $(".category-order", form).value = category?.sortOrder ?? 0;
+      $(".category-active", form).checked = category?.active ?? true;
+
+      if (isNew) {
+        setBadge($(".category-status", form), "Nova", "neutral");
+        $(".category-meta", form).textContent = "Preencha o nome; o identificador é sugerido a partir dele.";
+        // Sugere o identificador enquanto ele não for editado à mão
+        let idEdited = false;
+        idInput.addEventListener("input", () => { idEdited = true; });
+        nameInput.addEventListener("input", () => {
+          if (!idEdited) idInput.value = slugify(nameInput.value);
+        });
+      } else {
+        setBadge(
+          $(".category-status", form),
+          category.active ? "Ativa" : "Inativa",
+          category.active ? "active" : "rejected",
+        );
+        $(".category-meta", form).textContent = category.parentId
+          ? `Subcategoria de ${nameOf(category.parentId)} · ${category.id}`
+          : `Categoria principal · ${category.id}`;
+        const inUse = category.serviceCount > 0 || category.childCount > 0;
+        $(".category-usage", form).textContent = [
+          `${category.activeServiceCount} serviço(s) ativo(s)`,
+          category.childCount > 0 ? `${category.childCount} subcategoria(s)` : null,
+          inUse ? "em uso: para tirar do app, desative em vez de excluir" : null,
+        ].filter(Boolean).join(" · ");
+        deleteButton.hidden = inUse;
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const name = nameInput.value.trim();
+        const id = idInput.value.trim();
+        if (name.length < 2) {
+          showToast("O nome precisa de pelo menos 2 caracteres.", true);
+          return;
+        }
+        if (isNew && !CATEGORY_ID_PATTERN.test(id)) {
+          showToast("Identificador inválido: use letras minúsculas, números e hífens.", true);
+          return;
+        }
+        const order = Number($(".category-order", form).value || 0);
+        if (!Number.isInteger(order) || order < 0 || order > 9999) {
+          showToast("A ordem deve ser um número inteiro entre 0 e 9999.", true);
+          return;
+        }
+        const body = {
+          name,
+          icon: $(".category-icon", form).value,
+          parentId: $(".category-parent", form).value || null,
+          sortOrder: order,
+          active: $(".category-active", form).checked,
+        };
+        const saveButton = $(".category-save", form);
+        saveButton.disabled = true;
+        try {
+          if (isNew) {
+            await api("POST", "/api/v1/admin/categories", { id, ...body });
+            showToast(`Categoria ${name} criada.`);
+          } else {
+            await api("PUT", `/api/v1/admin/categories/${encodeURIComponent(category.id)}`, body);
+            showToast(`Categoria ${name} salva.`);
+          }
+          await load();
+        } catch (error) {
+          if (error.status !== 401) showToast(categoryErrorMessage(error), true);
+        } finally {
+          saveButton.disabled = false;
+        }
+      });
+
+      deleteButton.addEventListener("click", async () => {
+        if (!window.confirm(`Excluir a categoria ${category.name}? Isso não pode ser desfeito.`)) return;
+        deleteButton.disabled = true;
+        try {
+          await api("DELETE", `/api/v1/admin/categories/${encodeURIComponent(category.id)}`);
+          showToast(`Categoria ${category.name} excluída.`);
+          await load();
+        } catch (error) {
+          if (error.status !== 401) showToast(categoryErrorMessage(error), true);
+          deleteButton.disabled = false;
+        }
+      });
+      return form;
+    }
+
+    async function load() {
+      status.textContent = "Carregando...";
+      refreshButton.disabled = true;
+      try {
+        const result = await api("GET", "/api/v1/admin/categories");
+        categories = result?.items ?? [];
+        if (Array.isArray(result?.icons) && result.icons.length) icons = result.icons;
+        // Principais na ordem definida, cada uma seguida das suas subcategorias
+        const ordered = categories
+          .filter((category) => category.parentId === null)
+          .flatMap((root) => [root, ...categories.filter((category) => category.parentId === root.id)]);
+        const orphans = categories.filter((category) => !ordered.includes(category));
+        newSlot.replaceChildren(renderCategory(null));
+        list.replaceChildren(...[...ordered, ...orphans].map(renderCategory));
+        status.textContent = categories.length ? "" : "Nenhuma categoria cadastrada ainda.";
+      } catch (error) {
+        if (error.status !== 401) status.textContent = `Não foi possível carregar: ${error.message}`;
+      } finally {
+        refreshButton.disabled = false;
+      }
+    }
+    refreshButton.addEventListener("click", load);
+    return { load };
+  }
+
   // ---------- Seções ----------
 
   const panels = Object.fromEntries($$("[data-section-panel]").map((panel) => [panel.dataset.sectionPanel, panel]));
@@ -493,6 +685,7 @@
       },
     }),
     plans: createPlansSection(panels.plans),
+    categories: createCategoriesSection(panels.categories),
   };
   const loaded = new Set();
 

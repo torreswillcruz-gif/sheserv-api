@@ -547,3 +547,15 @@ UPDATE provider_profiles SET verified=true WHERE activation_status='active' AND 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_reason text;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS proposed_scheduled_at timestamptz;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS proposal_reason text;
+
+-- Categorias mantidas pelo painel admin: ícone (uma das chaves que o app sabe
+-- desenhar; ver CATEGORY_ICONS em admin-api/src/routes/admin.js), ativa e ordem
+-- de exibição. Categoria inativa some do app e não aceita serviço novo; os
+-- serviços que já usam a categoria continuam valendo.
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS icon text NOT NULL DEFAULT 'general';
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order int NOT NULL DEFAULT 0;
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+-- Categorias criadas antes do ícone existir: o id já era a chave do ícone no app
+UPDATE categories SET icon=id
+WHERE icon='general' AND id IN ('cleaning','beauty','fashion','cooking','learning','repairs');

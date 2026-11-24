@@ -282,3 +282,8 @@ label.check input { width: 18px; height: 18px; accent-color: var(--primary); }
   font-weight: 600;
 }
 .toast.error { background: var(--error); }
+
+/* Categorias: o formulário de criação fica acima da lista */
+.new-category { margin-bottom: 20px; }
+.category-card { align-content: start; }
+.category-card select { width: 100%; }
