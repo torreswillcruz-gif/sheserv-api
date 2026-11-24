@@ -16,12 +16,20 @@ const { formatWhen, notify, userName } = require("../notifications");
 
 const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 
+// Uma sugestão de horário vale até 1 hora antes do horário sugerido.
+const PROPOSAL_LEAD_MINUTES = 60;
+const proposalExpiresAt = (proposedAt) =>
+  new Date(new Date(proposedAt).getTime() - PROPOSAL_LEAD_MINUTES * 60000);
+
 // $1 = id de quem está logado.
 // - checkinCode: só o cliente vê.
 // - serviceLocation: "at_customer" (a prestadora vai até o cliente) ou "at_provider" (o cliente vai até ela).
 // - location (coordenadas do endereço do cliente, só em at_customer): o cliente sempre vê; a prestadora
 //   só vê depois de aceitar o pedido (antes disso o endereço fica protegido).
 // - venue (endereço exato da prestadora, só em at_provider): só aparece depois que o pedido é aceito.
+// - cancellationReason: motivo informado ao cancelar/recusar (pode ser nulo).
+// - timeProposal: outro horário sugerido pela prestadora, aguardando a cliente
+//   (expiresAt = 1 hora antes do horário sugerido; ver PROPOSAL_LEAD_MINUTES).
 const ORDER_SELECT_SQL = `
   SELECT
     orders.id,
@@ -37,6 +45,12 @@ const ORDER_SELECT_SQL = `
     orders.total_amount::float AS "totalAmount",
     orders.commission::float AS commission,
     orders.service_location AS "serviceLocation",
+    orders.cancellation_reason AS "cancellationReason",
+    CASE WHEN orders.proposed_scheduled_at IS NOT NULL THEN json_build_object(
+      'scheduledAt', orders.proposed_scheduled_at,
+      'reason', orders.proposal_reason,
+      'expiresAt', orders.proposed_scheduled_at - interval '60 minutes'
+    ) END AS "timeProposal",
     CASE WHEN orders.customer_id = $1 THEN orders.checkin_code END AS "checkinCode",
     CASE WHEN orders.service_location = 'at_customer'
            AND (orders.customer_id = $1 OR orders.status NOT IN ('requested', 'cancelled'))
@@ -229,9 +243,14 @@ ordersRouter.get("/me/orders/busy", asyncHandler(async (request, response) => {
 // Horários de um serviço num dia (horário de Brasília), para a tela de agendar.
 // Cada horário vem com available=false quando a prestadora já tem pedido nele
 // (reason "provider_busy") ou quando a própria pessoa tem compromisso (reason "your_commitment").
+// ?excludeOrderId= ignora um pedido de quem consulta (a prestadora escolhendo
+// outro horário para ele não vê o horário atual do pedido como ocupado).
 ordersRouter.get("/services/:id/slots", asyncHandler(async (request, response) => {
   if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Service not found.");
-  const { date } = z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict().parse(request.query);
+  const { date, excludeOrderId } = z.object({
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    excludeOrderId: z.string().uuid().optional(),
+  }).strict().parse(request.query);
   assertBookableDate(date);
 
   const { rows: services } = await runQuery(
@@ -244,7 +263,10 @@ ordersRouter.get("/services/:id/slots", asyncHandler(async (request, response) =
   const service = services[0];
   if (!service) throw new ApiError(404, "not_found", "Service not available.");
 
-  const { windows, slots } = await slotsForDay({ query: runQuery }, { service, dateKey: date, customerId: request.user.id });
+  const { windows, slots } = await slotsForDay(
+    { query: runQuery },
+    { service, dateKey: date, customerId: request.user.id, excludeOrderId: excludeOrderId ?? null }
+  );
   response.json({
     date,
     durationMinutes: service.duration_minutes,
@@ -285,7 +307,9 @@ function allowedActorForTransition(order, nextStatus) {
 // cliente recebe: aceito, a caminho (prestadora indo até ela), iniciado,
 // concluído; prestadora recebe: cliente a caminho (atendimento no espaço dela);
 // as duas recebem cancelamento e contestação feitos pela outra.
-async function notifyOrderStatus(transactionClient, order, nextStatus, actingUserId) {
+// Cancelamento pela prestadora antes do aceite é uma recusa; o motivo, se
+// houver, vai no texto do aviso.
+async function notifyOrderStatus(transactionClient, order, nextStatus, actingUserId, reason = null) {
   const actorIsCustomer = actingUserId === order.customer_id;
   const recipientId = actorIsCustomer ? order.provider_id : order.customer_id;
   const area = actorIsCustomer ? "provider" : "customer";
@@ -298,7 +322,9 @@ async function notifyOrderStatus(transactionClient, order, nextStatus, actingUse
       : ["A prestadora está a caminho", `${actor} saiu para o seu atendimento de ${when}.`],
     in_progress: ["Atendimento iniciado", `${actor} iniciou o atendimento.`],
     completed: ["Atendimento concluído", `Conte como foi: avalie o atendimento de ${actor}.`],
-    cancelled: ["Pedido cancelado", `${actor} cancelou o pedido de ${when}.`],
+    cancelled: !actorIsCustomer && order.status === "requested"
+      ? ["Pedido recusado", `${actor} recusou seu pedido de ${when}.`]
+      : ["Pedido cancelado", `${actor} cancelou o pedido de ${when}.`],
     disputed: ["Pedido contestado", `${actor} abriu uma contestação sobre o pedido de ${when}.`],
   };
   const message = messages[nextStatus];
@@ -307,23 +333,34 @@ async function notifyOrderStatus(transactionClient, order, nextStatus, actingUse
     userId: recipientId,
     type: `order_${nextStatus}`,
     title: message[0],
-    body: message[1],
+    body: reason ? `${message[1]} Motivo: ${reason}` : message[1],
     data: { orderId: order.id },
     area,
   });
 }
 
-async function applyStatusTransition(transactionClient, order, nextStatus, actingUserId, actingRole) {
+// `reason` só vale para cancelamento. `notifyOther: false` quando quem chama
+// manda um aviso próprio (ex.: cliente recusou o horário sugerido).
+async function applyStatusTransition(
+  transactionClient, order, nextStatus, actingUserId, actingRole, { reason = null, notifyOther = true } = {}
+) {
   const allowedActor = allowedActorForTransition(order, nextStatus);
   if (!allowedActor || (allowedActor !== "any" && allowedActor !== actingRole))
     throw new ApiError(409, "invalid_transition", `Cannot change from ${order.status} to ${nextStatus}.`);
 
-  await transactionClient.query("UPDATE orders SET status=$1 WHERE id=$2", [nextStatus, order.id]);
+  // Sair de "requested" (aceite ou cancelamento) encerra a sugestão de horário pendente
+  await transactionClient.query(
+    "UPDATE orders SET status=$1, proposed_scheduled_at=NULL, proposal_reason=NULL WHERE id=$2",
+    [nextStatus, order.id]
+  );
+  if (reason) {
+    await transactionClient.query("UPDATE orders SET cancellation_reason=$1 WHERE id=$2", [reason, order.id]);
+  }
   await transactionClient.query(
     "INSERT INTO order_events (order_id,actor_id,type,data) VALUES ($1,$2,'status_changed',$3)",
-    [order.id, actingUserId, { from: order.status, to: nextStatus }]
+    [order.id, actingUserId, { from: order.status, to: nextStatus, ...(reason ? { reason } : {}) }]
   );
-  await notifyOrderStatus(transactionClient, order, nextStatus, actingUserId);
+  if (notifyOther) await notifyOrderStatus(transactionClient, order, nextStatus, actingUserId, reason);
 
   if (nextStatus === "completed") {
     await transactionClient.query("UPDATE payments SET status='captured' WHERE order_id=$1", [order.id]);
@@ -351,21 +388,167 @@ async function applyStatusTransition(transactionClient, order, nextStatus, actin
   }
 }
 
+const reasonSchema = z.string().trim().min(1).max(200);
+
+// `reason` (opcional) só com status "cancelled": vai para o pedido
+// (cancellationReason) e para o aviso da outra parte.
 const changeStatusSchema = z.object({
   status: z.enum(["accepted", "on_the_way", "in_progress", "completed", "cancelled", "disputed"]),
-}).strict();
+  reason: reasonSchema.optional(),
+}).strict().refine((body) => !body.reason || body.status === "cancelled", {
+  message: "A reason is only accepted when cancelling.",
+  path: ["reason"],
+});
 
 ordersRouter.patch("/orders/:id/status", asyncHandler(async (request, response) => {
-  const { status: nextStatus } = changeStatusSchema.parse(request.body);
+  const { status: nextStatus, reason } = changeStatusSchema.parse(request.body);
 
   await runInTransaction(async (transactionClient) => {
     const order = await loadOrderForParticipant(request.params.id, request.user.id, transactionClient);
     const actingRole = order.provider_id === request.user.id ? "provider" : "customer";
-    await applyStatusTransition(transactionClient, order, nextStatus, request.user.id, actingRole);
+    await applyStatusTransition(transactionClient, order, nextStatus, request.user.id, actingRole, { reason });
   });
 
   const { rows: orderDetails } = await runQuery(`${ORDER_SELECT_SQL} WHERE orders.id = $2`, [request.user.id, request.params.id]);
   response.json(orderDetails[0]);
+}));
+
+// ---------- Sugerir outro horário (prestadora) e responder (cliente) ----------
+//
+// Antes de aceitar, a prestadora pode sugerir outro horário (ex.: está ocupada
+// no escolhido). O pedido continua "requested" com a sugestão pendente; uma
+// nova sugestão substitui a anterior. A cliente:
+// - aceita: o pedido passa para o novo horário e já fica "accepted";
+// - recusa: o pedido é cancelado e o pagamento retido, liberado.
+// A sugestão vale até 1 hora antes do horário sugerido. O horário sugerido não
+// fica reservado: a disponibilidade é conferida de novo quando a cliente aceita.
+
+const timeProposalSchema = z.object({
+  scheduledAt: z.string().datetime({ offset: true }),
+  reason: reasonSchema.optional(),
+}).strict();
+
+const orderDetails = async (userId, orderId) =>
+  (await runQuery(`${ORDER_SELECT_SQL} WHERE orders.id = $2`, [userId, orderId])).rows[0];
+
+// O novo horário cabe no horário de atendimento e está livre para as duas
+// (ignorando o próprio pedido). Devolve o fim do atendimento.
+async function assertNewTimeFits(transactionClient, order, start) {
+  const { rows: services } = await transactionClient.query("SELECT availability FROM services WHERE id=$1", [order.service_id]);
+  assertWithinAvailability(services[0]?.availability, start, order.duration_minutes);
+  return assertSlotFree(transactionClient, {
+    providerId: order.provider_id,
+    customerId: order.customer_id,
+    start,
+    durationMinutes: order.duration_minutes,
+    excludeOrderId: order.id,
+  });
+}
+
+// A sugestão pendente do pedido, para a cliente responder
+function pendingProposal(order, userId) {
+  if (order.customer_id !== userId)
+    throw new ApiError(403, "forbidden", "Only the customer answers a time proposal.");
+  if (order.status !== "requested" || !order.proposed_scheduled_at)
+    throw new ApiError(409, "no_time_proposal", "There is no time proposal to answer.");
+  return new Date(order.proposed_scheduled_at);
+}
+
+ordersRouter.post("/orders/:id/time-proposal", requireRole("prestadora"), asyncHandler(async (request, response) => {
+  const proposal = timeProposalSchema.parse(request.body);
+  const proposedAt = new Date(proposal.scheduledAt);
+  if (proposalExpiresAt(proposedAt) <= new Date())
+    throw new ApiError(422, "validation_error", "Invalid.", {
+      scheduledAt: "Sugira um horário com pelo menos 1 hora de antecedência.",
+    });
+
+  await runInTransaction(async (transactionClient) => {
+    const order = await loadOrderForParticipant(request.params.id, request.user.id, transactionClient);
+    if (order.provider_id !== request.user.id) throw new ApiError(403, "forbidden", "Not your order.");
+    if (order.status !== "requested")
+      throw new ApiError(409, "invalid_transition", "Only orders not yet accepted can get another time.");
+    if (proposedAt.getTime() === new Date(order.scheduled_at).getTime())
+      throw new ApiError(422, "validation_error", "Invalid.", { scheduledAt: "Escolha um horário diferente do pedido." });
+
+    await assertNewTimeFits(transactionClient, order, proposedAt);
+    await transactionClient.query(
+      "UPDATE orders SET proposed_scheduled_at=$1, proposal_reason=$2 WHERE id=$3",
+      [proposedAt, proposal.reason ?? null, order.id]
+    );
+    await transactionClient.query(
+      "INSERT INTO order_events (order_id,actor_id,type,data) VALUES ($1,$2,'time_proposed',$3)",
+      [order.id, request.user.id, { from: order.scheduled_at, to: proposedAt, ...(proposal.reason ? { reason: proposal.reason } : {}) }]
+    );
+    const actor = await userName(transactionClient, request.user.id);
+    const body = `${actor} não pode em ${formatWhen(order.scheduled_at)} e sugeriu ${formatWhen(proposedAt)}.`;
+    await notify(transactionClient, {
+      userId: order.customer_id,
+      type: "order_reschedule_proposed",
+      title: "Nova sugestão de horário",
+      body: proposal.reason ? `${body} Motivo: ${proposal.reason}` : body,
+      data: { orderId: order.id },
+      area: "customer",
+    });
+  });
+  response.json(await orderDetails(request.user.id, request.params.id));
+}));
+
+ordersRouter.post("/orders/:id/time-proposal/accept", asyncHandler(async (request, response) => {
+  await runInTransaction(async (transactionClient) => {
+    const order = await loadOrderForParticipant(request.params.id, request.user.id, transactionClient);
+    const proposedAt = pendingProposal(order, request.user.id);
+    if (proposalExpiresAt(proposedAt) <= new Date())
+      throw new ApiError(409, "proposal_expired", "The suggested time is no longer valid.");
+
+    const endAt = await assertNewTimeFits(transactionClient, order, proposedAt);
+    await transactionClient.query(
+      `UPDATE orders SET scheduled_at=$1, status='accepted', proposed_scheduled_at=NULL, proposal_reason=NULL
+       WHERE id=$2`,
+      [proposedAt, order.id]
+    );
+    await transactionClient.query("UPDATE payments SET held_until=$1 WHERE order_id=$2 AND status='held'", [endAt, order.id]);
+    await transactionClient.query(
+      "INSERT INTO order_events (order_id,actor_id,type,data) VALUES ($1,$2,'time_proposal_accepted',$3)",
+      [order.id, request.user.id, { from: order.scheduled_at, to: proposedAt }]
+    );
+    await transactionClient.query(
+      "INSERT INTO order_events (order_id,actor_id,type,data) VALUES ($1,$2,'status_changed',$3)",
+      [order.id, request.user.id, { from: "requested", to: "accepted" }]
+    );
+    await notify(transactionClient, {
+      userId: order.provider_id,
+      type: "order_reschedule_accepted",
+      title: "Novo horário aceito",
+      body: `${await userName(transactionClient, request.user.id)} aceitou ${formatWhen(proposedAt)}. O pedido está confirmado.`,
+      data: { orderId: order.id },
+      area: "provider",
+    });
+  });
+  response.json(await orderDetails(request.user.id, request.params.id));
+}));
+
+ordersRouter.post("/orders/:id/time-proposal/decline", asyncHandler(async (request, response) => {
+  await runInTransaction(async (transactionClient) => {
+    const order = await loadOrderForParticipant(request.params.id, request.user.id, transactionClient);
+    const proposedAt = pendingProposal(order, request.user.id);
+    await applyStatusTransition(transactionClient, order, "cancelled", request.user.id, "customer", {
+      reason: "A cliente recusou o horário sugerido.",
+      notifyOther: false,
+    });
+    await transactionClient.query(
+      "INSERT INTO order_events (order_id,actor_id,type,data) VALUES ($1,$2,'time_proposal_declined',$3)",
+      [order.id, request.user.id, { proposed: proposedAt }]
+    );
+    await notify(transactionClient, {
+      userId: order.provider_id,
+      type: "order_reschedule_declined",
+      title: "Horário sugerido recusado",
+      body: `${await userName(transactionClient, request.user.id)} recusou ${formatWhen(proposedAt)}. O pedido foi cancelado.`,
+      data: { orderId: order.id },
+      area: "provider",
+    });
+  });
+  response.json(await orderDetails(request.user.id, request.params.id));
 }));
 
 // ---------- Check-in / check-out (só prestadora) ----------

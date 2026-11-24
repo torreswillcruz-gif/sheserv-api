@@ -541,3 +541,9 @@ CREATE INDEX IF NOT EXISTS idx_verifications_result ON verifications(result, cre
 -- Aprovar a prestadora é a verificação dela: quem já estava aprovada passa a
 -- constar como verificada (o catálogo do app só mostra aprovadas e verificadas).
 UPDATE provider_profiles SET verified=true WHERE activation_status='active' AND verified=false;
+
+-- Motivo do cancelamento/recusa e sugestão de outro horário pela prestadora
+-- (pedido ainda "requested"; a cliente aceita ou recusa). Ver src/routes/orders.js.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_reason text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS proposed_scheduled_at timestamptz;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS proposal_reason text;

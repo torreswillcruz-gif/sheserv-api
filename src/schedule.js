@@ -85,46 +85,51 @@ function assertWithinAvailability(availability, startDate, durationMinutes) {
     });
 }
 
-// Algum pedido ativo da prestadora se sobrepõe a [start, end)?
-async function providerIsBusy(databaseClient, providerId, start, end) {
+// Algum pedido ativo da prestadora se sobrepõe a [start, end)? `excludeOrderId`
+// ignora o próprio pedido (ao mudar o horário dele).
+async function providerIsBusy(databaseClient, providerId, start, end, excludeOrderId = null) {
   const { rows } = await databaseClient.query(
     `SELECT 1 FROM orders
      WHERE provider_id=$1 AND status = ANY($4::text[])
        AND $2 < scheduled_at + duration_minutes * interval '1 minute' AND $3 > scheduled_at
+       AND ($5::uuid IS NULL OR id <> $5::uuid)
      LIMIT 1`,
-    [providerId, start, end, ACTIVE_ORDER_STATUSES]
+    [providerId, start, end, ACTIVE_ORDER_STATUSES, excludeOrderId]
   );
   return Boolean(rows[0]);
 }
 
 // A pessoa já tem compromisso (como cliente ou como prestadora) em [start, end)?
-async function userHasCommitment(databaseClient, userId, start, end) {
+async function userHasCommitment(databaseClient, userId, start, end, excludeOrderId = null) {
   const { rows } = await databaseClient.query(
     `SELECT 1 FROM orders
      WHERE (customer_id=$1 OR provider_id=$1) AND status = ANY($4::text[])
        AND $2 < scheduled_at + duration_minutes * interval '1 minute' AND $3 > scheduled_at
+       AND ($5::uuid IS NULL OR id <> $5::uuid)
      LIMIT 1`,
-    [userId, start, end, ACTIVE_ORDER_STATUSES]
+    [userId, start, end, ACTIVE_ORDER_STATUSES, excludeOrderId]
   );
   return Boolean(rows[0]);
 }
 
-// Verificações feitas ao marcar um horário (pedido direto ou aprovação de orçamento)
-async function assertSlotFree(databaseClient, { providerId, customerId, start, durationMinutes }) {
+// Verificações feitas ao marcar um horário (pedido direto, aprovação de orçamento
+// ou novo horário sugerido; neste caso `excludeOrderId` é o próprio pedido)
+async function assertSlotFree(databaseClient, { providerId, customerId, start, durationMinutes, excludeOrderId = null }) {
   const end = new Date(start.getTime() + durationMinutes * 60000);
-  if (await providerIsBusy(databaseClient, providerId, start, end))
+  if (await providerIsBusy(databaseClient, providerId, start, end, excludeOrderId))
     throw new ApiError(409, "slot_unavailable", "Slot unavailable.", {
       scheduledAt: "Esse horário não está mais disponível. Escolha outro.",
     });
-  if (await userHasCommitment(databaseClient, customerId, start, end))
+  if (await userHasCommitment(databaseClient, customerId, start, end, excludeOrderId))
     throw new ApiError(409, "schedule_conflict", "You already have a commitment at this time.", {
       scheduledAt: "Você já tem um compromisso nesse horário.",
     });
   return end;
 }
 
-// Horários de início possíveis num dia, marcando os ocupados
-async function slotsForDay(databaseClient, { service, dateKey, customerId, now = new Date() }) {
+// Horários de início possíveis num dia, marcando os ocupados. `excludeOrderId`
+// ignora um pedido de quem consulta (a prestadora sugerindo outro horário para ele).
+async function slotsForDay(databaseClient, { service, dateKey, customerId, excludeOrderId = null, now = new Date() }) {
   const windows = normalizeAvailability(service.availability);
   const weekday = weekdayOfDateKey(dateKey);
   const dayWindows = windows.length === 0
@@ -137,8 +142,9 @@ async function slotsForDay(databaseClient, { service, dateKey, customerId, now =
   const { rows: busyOrders } = await databaseClient.query(
     `SELECT scheduled_at, duration_minutes, provider_id, customer_id FROM orders
      WHERE (provider_id=$1 OR customer_id=$2 OR provider_id=$2) AND status = ANY($5::text[])
-       AND scheduled_at < $4 AND scheduled_at + duration_minutes * interval '1 minute' > $3`,
-    [service.provider_id, customerId, dayStart, dayEnd, ACTIVE_ORDER_STATUSES]
+       AND scheduled_at < $4 AND scheduled_at + duration_minutes * interval '1 minute' > $3
+       AND ($6::uuid IS NULL OR id <> $6::uuid OR NOT (customer_id=$2 OR provider_id=$2))`,
+    [service.provider_id, customerId, dayStart, dayEnd, ACTIVE_ORDER_STATUSES, excludeOrderId]
   );
 
   const slots = [];
