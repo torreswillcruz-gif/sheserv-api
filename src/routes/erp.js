@@ -127,7 +127,7 @@ erpRouter.get("/me/financial/dashboard", requirePlanFeature("finance"), asyncHan
     : period === "year"
       ? "(extract(month from occurred_at)::int - 1)"
       : "floor((extract(day from occurred_at) - 1) / 7)::int";
-  const [summaryResult, entriesResult, cashFlowResult] = await Promise.all([
+  const [summaryResult, entriesResult, cashFlowResult, categoriesResult] = await Promise.all([
     runQuery(
       `SELECT entry_type AS "entryType",coalesce(sum(amount),0)::float AS total
        FROM financial_entries
@@ -137,6 +137,7 @@ erpRouter.get("/me/financial/dashboard", requirePlanFeature("finance"), asyncHan
     ),
     runQuery(
       `SELECT id,entry_type AS "entryType",amount::float,category,description,
+              payment_method AS "paymentMethod",
               occurred_at AS "occurredAt",customer_id AS "customerId",
               source_order_id AS "sourceOrderId"
        FROM financial_entries
@@ -152,6 +153,17 @@ erpRouter.get("/me/financial/dashboard", requirePlanFeature("finance"), asyncHan
        WHERE provider_id=$1 AND occurred_at >= $2
          AND entry_type IN ('income','expense')
        GROUP BY 1 ORDER BY 1`,
+      [request.user.id, periodStart],
+    ),
+    // De onde veio e para onde foi o dinheiro: total por categoria, separando
+    // o que veio de atendimentos do app (source_order_id) do que veio por fora.
+    runQuery(
+      `SELECT entry_type AS "entryType",category,
+              (source_order_id IS NOT NULL) AS "fromApp",
+              coalesce(sum(amount),0)::float AS total,count(*)::int AS count
+       FROM financial_entries
+       WHERE provider_id=$1 AND occurred_at >= $2
+       GROUP BY 1,2,3 ORDER BY total DESC`,
       [request.user.id, periodStart],
     ),
   ]);
@@ -170,6 +182,7 @@ erpRouter.get("/me/financial/dashboard", requirePlanFeature("finance"), asyncHan
       profit: (totals.income ?? 0) - (totals.expense ?? 0),
     },
     entries: entriesResult.rows,
+    byCategory: categoriesResult.rows,
     cashFlow: labels.map((label, index) => ({
       label,
       income: buckets.get(index)?.income ?? 0,
@@ -214,6 +227,40 @@ erpRouter.post("/me/financial/entries", requirePlanFeature("finance"), asyncHand
      data.paymentMethod ?? null, data.customerId ?? null, data.occurredAt ?? new Date()]
   );
   response.status(201).json(rows[0]);
+}));
+
+// Conta a receber que entrou: vira receita com a data de hoje (ou a informada).
+erpRouter.patch("/me/financial/entries/:entryId/received", requirePlanFeature("finance"), asyncHandler(async (request, response) => {
+  const entryId = z.string().uuid().parse(request.params.entryId);
+  const data = z.object({
+    occurredAt: z.string().datetime({ offset: true }).optional(),
+    paymentMethod: z.string().trim().max(100).nullable().optional(),
+  }).strict().parse(request.body ?? {});
+  const { rows } = await runQuery(
+    `UPDATE financial_entries
+     SET entry_type='income',occurred_at=$3,payment_method=coalesce($4,payment_method)
+     WHERE id=$1 AND provider_id=$2 AND entry_type='receivable'
+     RETURNING id,entry_type AS "entryType",amount::float,category,description,
+               payment_method AS "paymentMethod",occurred_at AS "occurredAt",
+               source_order_id AS "sourceOrderId"`,
+    [entryId, request.user.id, data.occurredAt ?? new Date(), data.paymentMethod ?? null]
+  );
+  if (!rows[0]) throw new ApiError(404, "entry_not_found", "Receivable entry not found.");
+  response.json(rows[0]);
+}));
+
+// Só lançamentos feitos à mão; os dos atendimentos do app ficam (são o histórico do pedido).
+erpRouter.delete("/me/financial/entries/:entryId", requirePlanFeature("finance"), asyncHandler(async (request, response) => {
+  const entryId = z.string().uuid().parse(request.params.entryId);
+  const { rows } = await runQuery(
+    "SELECT source_order_id AS \"sourceOrderId\" FROM financial_entries WHERE id=$1 AND provider_id=$2",
+    [entryId, request.user.id]
+  );
+  if (!rows[0]) throw new ApiError(404, "entry_not_found", "Entry not found.");
+  if (rows[0].sourceOrderId)
+    throw new ApiError(409, "entry_from_order", "Entries created by an order cannot be deleted.");
+  await runQuery("DELETE FROM financial_entries WHERE id=$1 AND provider_id=$2", [entryId, request.user.id]);
+  response.status(204).end();
 }));
 
 erpRouter.get("/me/clients", requirePlanFeature("clients"), asyncHandler(async (request, response) => {
