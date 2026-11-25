@@ -90,6 +90,8 @@ const PROVIDER_SELECT_SQL = `
     provider_user.id,
     provider_user.name,
     provider_profile.bio,
+    provider_brand.brand_name AS "brandName",
+    provider_brand.tagline AS "brandTagline",
     provider_profile.verified,
     provider_profile.activation_status AS "activationStatus",
     COALESCE(ratings.average_rating, 0)::float AS rating,
@@ -137,7 +139,16 @@ const PROVIDER_SELECT_SQL = `
     WHERE direction = 'customer_to_provider'
     GROUP BY target_id
   ) ratings ON ratings.target_id = provider_user.id
-  LEFT JOIN provider_venues provider_venue ON provider_venue.provider_id = provider_user.id`;
+  LEFT JOIN provider_venues provider_venue ON provider_venue.provider_id = provider_user.id
+  -- Nome da marca só enquanto o plano da prestadora tiver o recurso "branding"
+  LEFT JOIN LATERAL (
+    SELECT branding.brand_name, branding.tagline
+    FROM provider_branding branding
+    JOIN plan_catalog brand_plan ON brand_plan.plan_code = COALESCE(
+      (SELECT plan_name FROM provider_plans WHERE provider_id = provider_user.id), 'free')
+    WHERE branding.provider_id = provider_user.id
+      AND COALESCE(brand_plan.features->>'branding', 'false') = 'true'
+  ) provider_brand ON true`;
 
 catalogRouter.get("/providers", asyncHandler(async (request, response) => {
   const searchParams = providerSearchSchema.parse(request.query);
@@ -153,6 +164,7 @@ catalogRouter.get("/providers", asyncHandler(async (request, response) => {
      WHERE provider_profile.activation_status = 'active'
        AND ($4::text IS NULL
             OR provider_user.name ILIKE '%' || $4::text || '%'
+            OR provider_brand.brand_name ILIKE '%' || $4::text || '%'
             OR EXISTS (SELECT 1 FROM services matching_service
                        WHERE matching_service.provider_id = provider_user.id
                          AND matching_service.active

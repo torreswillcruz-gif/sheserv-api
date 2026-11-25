@@ -48,6 +48,10 @@ O cadastro público não pode criar administradores.
   mensal de atendimentos, clientes, receitas e despesas.
 - `/api/v1/me/insights` devolve os totais mensais do financeiro (6 meses fechados + o atual)
   e o resumo do inventário; o app calcula as dicas, o ponto de equilíbrio e a previsão.
+- Ferramentas do Pro (`src/routes/business.js`): perfil da marca (`/me/branding`, aparece no
+  catálogo só com o recurso `branding`), dados fiscais e notas de serviço (`/me/fiscal`,
+  `/me/invoices`, hoje em rascunho; a integração de emissão está avaliada em
+  `docs/NOTAS_FISCAIS.md` no app) e orçamento livre (`/me/custom-quotes`).
 - Inventário (`/api/v1/me/inventory`, recurso `inventory`, do Standard em diante): itens com
   quantidade, mínimo e custo; compra, uso, perda e contagem em transação, sem deixar o estoque
   negativo (409 `insufficient_stock`). Compra e perda podem gerar a saída no financeiro.

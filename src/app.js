@@ -14,6 +14,7 @@ const safetyRoutes = require("./routes/safety");
 const socialRoutes = require("./routes/social");
 const { quotesRouter } = require("./routes/quotes");
 const { erpRouter } = require("./routes/erp");
+const { businessRouter } = require("./routes/business");
 const { notificationsRouter } = require("./routes/notifications");
 
 const FIFTEEN_MINUTES_IN_MS = 15 * 60 * 1000;
@@ -48,6 +49,8 @@ apiV1Router.use(safetyRoutes);
 apiV1Router.use(socialRoutes);
 apiV1Router.use(quotesRouter);
 apiV1Router.use(notificationsRouter);
+// Antes do erpRouter: ele exige papel de prestadora para tudo que passa por ele.
+apiV1Router.use(businessRouter);
 apiV1Router.use(erpRouter);
 
 app.use(

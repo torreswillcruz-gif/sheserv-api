@@ -714,4 +714,4 @@ erpRouter.post("/me/team", requirePlanFeature("team"), asyncHandler(async (reque
   response.status(201).json(rows[0]);
 }));
 
-module.exports = { erpRouter };
+module.exports = { erpRouter, requirePlanFeature };

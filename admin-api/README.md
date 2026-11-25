@@ -111,7 +111,7 @@ shape.
 Every approval, plan edit, assignment, and category change is written to
 `admin_audit_events`. The plan catalog is shared with the marketplace API.
 Monthly quote limits and the `finance`, `inventory`, `clients`, `statistics`,
-`promotions`, and `team` features are enforced by the API and reflected in the provider app.
+`promotions`, `team`, `branding`, `invoices`, and `custom_quotes` features are enforced by the API and reflected in the provider app.
 Other feature flags are stored and returned for future consumers.
 
 ## Render deployment

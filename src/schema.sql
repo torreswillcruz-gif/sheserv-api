@@ -283,13 +283,13 @@ CREATE TABLE IF NOT EXISTS plan_catalog (
 INSERT INTO plan_catalog (plan_code,display_name,description,monthly_approval_limit,features)
 VALUES
   ('free','Grátis','Recursos básicos da prestadora.',20,
-    '{"finance":true,"inventory":false,"clients":false,"statistics":false,"promotions":false,"team":false}'::jsonb),
+    '{"finance":true,"inventory":false,"clients":false,"statistics":false,"promotions":false,"team":false,"branding":false,"invoices":false,"custom_quotes":false}'::jsonb),
   ('standard','Standard','Mais solicitações de orçamento por mês.',40,
-    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":false,"team":false}'::jsonb),
+    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":false,"team":false,"branding":false,"invoices":false,"custom_quotes":false}'::jsonb),
   ('pro','Pro','Limite ampliado de solicitações de orçamento.',100,
-    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":true,"team":false}'::jsonb),
+    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":true,"team":false,"branding":true,"invoices":true,"custom_quotes":true}'::jsonb),
   ('premium','Premium','Solicitações sem limite fixo e gestão de equipe.',NULL,
-    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":true,"team":true}'::jsonb)
+    '{"finance":true,"inventory":true,"clients":true,"statistics":true,"promotions":true,"team":true,"branding":true,"invoices":true,"custom_quotes":true}'::jsonb)
 ON CONFLICT (plan_code) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS provider_plans (
@@ -595,3 +595,81 @@ CREATE INDEX IF NOT EXISTS idx_inventory_movements_item ON inventory_movements(i
 -- que o admin já tiver definido.
 UPDATE plan_catalog SET features = features || jsonb_build_object('inventory', plan_code <> 'free')
 WHERE NOT features ? 'inventory';
+
+-- Perfil da marca (nome fantasia, frase, redes), dados fiscais para nota de
+-- serviço, notas pedidas e orçamentos livres. Recursos do plano Pro em diante.
+CREATE TABLE IF NOT EXISTS provider_branding (
+  provider_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  brand_name text,
+  tagline text,
+  instagram text,
+  whatsapp text,
+  website text,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS provider_fiscal_profiles (
+  provider_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  cnpj text NOT NULL,
+  legal_name text NOT NULL,
+  tax_regime text NOT NULL
+    CHECK (tax_regime IN ('mei','simples_nacional','lucro_presumido','lucro_real')),
+  municipal_registration text,
+  city_code text,
+  service_code text,
+  iss_rate numeric(5,2) CHECK (iss_rate IS NULL OR (iss_rate >= 0 AND iss_rate <= 5)),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Nota de serviço pedida pela prestadora. Sem integração de emissão ativa, fica
+-- como rascunho; com ela, passa por processing → issued/error (ver
+-- docs/NOTAS_FISCAIS.md no app). O documento de quem contratou fica cifrado.
+CREATE TABLE IF NOT EXISTS service_invoices (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
+  customer_name text NOT NULL,
+  customer_document_encrypted text,
+  customer_email text,
+  description text NOT NULL,
+  amount numeric(10,2) NOT NULL CHECK (amount > 0),
+  service_date date NOT NULL,
+  status text NOT NULL DEFAULT 'draft'
+    CHECK (status IN ('draft','processing','issued','error','canceled')),
+  number text,
+  verification_code text,
+  pdf_url text,
+  xml_url text,
+  external_id text,
+  status_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_invoices_provider ON service_invoices(provider_id, created_at);
+
+-- Orçamento livre: feito pela prestadora para qualquer pessoa (fora do fluxo
+-- de solicitações do app) e exportado em PDF ou texto.
+CREATE TABLE IF NOT EXISTS custom_quotes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  number int NOT NULL,
+  customer_name text NOT NULL,
+  customer_contact text,
+  items jsonb NOT NULL CHECK (jsonb_typeof(items) = 'array'),
+  discount numeric(10,2) NOT NULL DEFAULT 0 CHECK (discount >= 0),
+  valid_until date,
+  notes text,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','sent','accepted','declined')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (provider_id, number)
+);
+
+-- Recursos novos nos planos (Pro e Premium), sem sobrescrever o que o admin
+-- já tiver definido.
+UPDATE plan_catalog SET features = features || jsonb_build_object('branding', plan_code IN ('pro','premium'))
+WHERE NOT features ? 'branding';
+UPDATE plan_catalog SET features = features || jsonb_build_object('invoices', plan_code IN ('pro','premium'))
+WHERE NOT features ? 'invoices';
+UPDATE plan_catalog SET features = features || jsonb_build_object('custom_quotes', plan_code IN ('pro','premium'))
+WHERE NOT features ? 'custom_quotes';
