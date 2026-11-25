@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const { errorHandler, ApiError } = require("./errors");
 const { requireAuthentication, requireRole } = require("./security");
+const { requireVerifiedIdentity } = require("./identity");
 
 const authRoutes = require("./routes/auth");
 const catalogRoutes = require("./routes/catalog");
@@ -42,6 +43,8 @@ apiV1Router.use(catalogRoutes);
 
 // Daqui para baixo tudo exige o Bearer token
 apiV1Router.use(requireAuthentication);
+// Conta sem identidade verificada só usa o que leva à verificação (ver identity.js)
+apiV1Router.use(requireVerifiedIdentity);
 apiV1Router.use(ordersRouter);
 apiV1Router.use(addressRoutes);
 apiV1Router.use("/provider", requireRole("prestadora"), providerRoutes);

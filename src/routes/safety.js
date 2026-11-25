@@ -5,6 +5,7 @@ const { ApiError, asyncHandler } = require("../errors");
 const { encryptText, decryptText } = require("../security");
 const { loadOrderForParticipant } = require("./orders");
 const { isValidUuid } = require("../validation");
+const { loadIdentityStatus } = require("../identity");
 
 const VERIFICATION_TYPES = ["cpf_selfie", "gender_eligibility", "background_check", "proof_of_address", "references"];
 
@@ -23,6 +24,12 @@ safetyRouter.get("/me/verifications", asyncHandler(async (request, response) => 
     [request.user.id]
   );
   response.json(verifications);
+}));
+
+// Situação da identidade da conta: o app só abre a home com "verified".
+safetyRouter.get("/me/identity", asyncHandler(async (request, response) => {
+  const identity = await loadIdentityStatus(request.user.id);
+  response.json({ identityStatus: identity.status, reviewNote: identity.reviewNote });
 }));
 
 safetyRouter.post("/me/verifications", asyncHandler(async (request, response) => {

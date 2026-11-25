@@ -27,8 +27,12 @@ database.runInTransaction = async (transactionCallback) => transactionCallback({
 
 const app = require("../../src/app");
 
+// Por padrão a conta tem identidade verificada; testes do bloqueio
+// passam a própria regra para identity_status antes desta.
+const verifiedIdentityRule = { pattern: /AS identity_status/, rows: [{ identity_status: "verified" }] };
+
 function resetDatabase(rules = []) {
-  fakeDatabase.rules = rules;
+  fakeDatabase.rules = [...rules, verifiedIdentityRule];
   fakeDatabase.log = [];
 }
 
