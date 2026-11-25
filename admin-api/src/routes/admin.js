@@ -35,6 +35,13 @@ const assignPlanSchema = z.object({
   planCode: z.enum(PLAN_CODES),
 }).strict();
 
+// Exceções de recursos por prestadora: true libera, false bloqueia; recurso
+// fora do mapa segue o plano. O mapa enviado substitui o anterior inteiro.
+const featureOverridesSchema = z.object({
+  overrides: z.record(z.string().regex(/^[a-z][a-zA-Z0-9_]*$/), z.boolean())
+    .refine((overrides) => Object.keys(overrides).length <= 50),
+}).strict();
+
 const auditQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   offset: z.coerce.number().int().min(0).max(10000).default(0),
@@ -61,6 +68,8 @@ adminRouter.get("/providers", asyncHandler(async (request, response) => {
        provider_profile.verified AS "identityVerified",
        COALESCE(provider_plan.plan_name,'free') AS "planCode",
        COALESCE(plan.display_name,'Grátis') AS "planName",
+       COALESCE(plan.features,'{}'::jsonb) AS "planFeatures",
+       COALESCE(feature_override.overrides,'{}'::jsonb) AS "featureOverrides",
        COALESCE((
          SELECT json_agg(json_build_object(
            'title',offered.title,
@@ -77,6 +86,7 @@ adminRouter.get("/providers", asyncHandler(async (request, response) => {
      JOIN users provider_user ON provider_user.id=provider_profile.user_id
      LEFT JOIN provider_plans provider_plan ON provider_plan.provider_id=provider_user.id
      LEFT JOIN plan_catalog plan ON plan.plan_code=COALESCE(provider_plan.plan_name,'free')
+     LEFT JOIN provider_feature_overrides feature_override ON feature_override.provider_id=provider_user.id
      WHERE provider_user.roles @> ARRAY['prestadora']::text[]
        AND ($1::text IS NULL OR provider_profile.activation_status=$1)
      ORDER BY CASE provider_profile.activation_status WHEN 'pending' THEN 0 ELSE 1 END,
@@ -311,6 +321,36 @@ adminRouter.patch("/providers/:id/plan", asyncHandler(async (request, response) 
   response.json(result);
 }));
 
+adminRouter.put("/providers/:id/features", asyncHandler(async (request, response) => {
+  validateUuid(request.params.id, "Provider not found.");
+  const { overrides } = featureOverridesSchema.parse(request.body);
+
+  const saved = await runInTransaction(async (transaction) => {
+    const { rows: providers } = await transaction.query(
+      `SELECT provider_user.id,COALESCE(feature_override.overrides,'{}'::jsonb) AS overrides
+       FROM users provider_user
+       LEFT JOIN provider_feature_overrides feature_override ON feature_override.provider_id=provider_user.id
+       WHERE provider_user.id=$1 AND provider_user.roles @> ARRAY['prestadora']::text[]`,
+      [request.params.id]
+    );
+    if (!providers[0]) throw new ApiError(404, "not_found", "Provider not found.");
+
+    const { rows } = await transaction.query(
+      `INSERT INTO provider_feature_overrides (provider_id,overrides,updated_at)
+       VALUES ($1,$2,now())
+       ON CONFLICT (provider_id) DO UPDATE SET overrides=EXCLUDED.overrides,updated_at=now()
+       RETURNING provider_id AS "providerId",overrides AS "featureOverrides",updated_at AS "updatedAt"`,
+      [request.params.id, JSON.stringify(overrides)]
+    );
+    await recordAudit(transaction, request.user.id, "provider.features_changed", "provider", request.params.id, {
+      before: providers[0].overrides,
+      after: overrides,
+    });
+    return rows[0];
+  });
+  response.json(saved);
+}));
+
 // ---------- Categorias ----------
 //
 // Mantidas pelo admin: o app lista só as ativas, na ordem `sortOrder`.
@@ -450,6 +490,100 @@ adminRouter.delete("/categories/:id", asyncHandler(async (request, response) => 
     await recordAudit(transaction, request.user.id, "category.deleted", "category", categoryId, existing[0]);
   });
   response.status(204).end();
+}));
+
+// ---------- Serviços (visibilidade no app) ----------
+//
+// O admin oculta um serviço sem apagá-lo: ele sai da busca do app e não recebe
+// agendamentos novos; a prestadora continua vendo o serviço, com o motivo.
+// Pedidos já feitos não mudam. Serviços excluídos pela prestadora não aparecem.
+
+const serviceListSchema = z.object({
+  visibility: z.enum(["all", "visible", "hidden"]).default("all"),
+  query: z.string().trim().max(120).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  offset: z.coerce.number().int().min(0).max(10000).default(0),
+}).strict();
+
+const serviceVisibilitySchema = z.object({
+  hidden: z.boolean(),
+  reason: z.string().trim().min(1).max(500).optional(),
+}).strict().refine(
+  (change) => !change.hidden || Boolean(change.reason),
+  { message: "A reason is required when hiding a service.", path: ["reason"] }
+);
+
+const ADMIN_SERVICE_COLUMNS = `service.id,service.title,service.base_price::float AS "basePrice",
+  service.price_type AS "priceType",service.service_location AS "serviceLocation",
+  service.duration_minutes AS "durationMinutes",service.created_at AS "createdAt",
+  service.hidden_by_admin AS "hiddenByAdmin",service.hidden_reason AS "hiddenReason",
+  service.category_id AS "categoryId",category.name AS "categoryName",category.active AS "categoryActive",
+  service.provider_id AS "providerId",provider_user.name AS "providerName",
+  provider_profile.activation_status AS "providerStatus"`;
+
+const ADMIN_SERVICE_FROM = `FROM services service
+  JOIN users provider_user ON provider_user.id=service.provider_id
+  LEFT JOIN provider_profiles provider_profile ON provider_profile.user_id=service.provider_id
+  LEFT JOIN categories category ON category.id=service.category_id`;
+
+adminRouter.get("/services", asyncHandler(async (request, response) => {
+  const filters = serviceListSchema.parse(request.query);
+  const { rows } = await runQuery(
+    `SELECT ${ADMIN_SERVICE_COLUMNS}
+     ${ADMIN_SERVICE_FROM}
+     WHERE service.active
+       AND ($1::text='all' OR service.hidden_by_admin=($1::text='hidden'))
+       AND ($2::text IS NULL
+            OR service.title ILIKE '%' || $2::text || '%'
+            OR provider_user.name ILIKE '%' || $2::text || '%'
+            OR category.name ILIKE '%' || $2::text || '%')
+     ORDER BY service.hidden_by_admin DESC,provider_user.name,service.title
+     LIMIT $3 OFFSET $4`,
+    [filters.visibility, filters.query || null, filters.limit, filters.offset]
+  );
+  response.json({ items: rows, limit: filters.limit, offset: filters.offset });
+}));
+
+adminRouter.patch("/services/:id/visibility", asyncHandler(async (request, response) => {
+  validateUuid(request.params.id, "Service not found.");
+  const change = serviceVisibilitySchema.parse(request.body);
+
+  const updated = await runInTransaction(async (transaction) => {
+    const { rows: existing } = await transaction.query(
+      `SELECT id,title,provider_id,hidden_by_admin FROM services WHERE id=$1 AND active FOR UPDATE`,
+      [request.params.id]
+    );
+    if (!existing[0]) throw new ApiError(404, "not_found", "Service not found.");
+    const service = existing[0];
+
+    await transaction.query(
+      "UPDATE services SET hidden_by_admin=$2,hidden_reason=$3 WHERE id=$1",
+      [service.id, change.hidden, change.hidden ? change.reason : null]
+    );
+    // Só avisa a prestadora quando a situação muda de fato
+    if (service.hidden_by_admin !== change.hidden) {
+      const notification = change.hidden
+        ? ["Serviço oculto no app", `O serviço "${service.title}" foi ocultado pela equipe SheServe. Motivo: ${change.reason}`]
+        : ["Serviço visível de novo", `O serviço "${service.title}" voltou a aparecer no app.`];
+      await transaction.query(
+        "INSERT INTO notifications (user_id,type,title,body) VALUES ($1,$2,$3,$4)",
+        [service.provider_id, change.hidden ? "service_hidden" : "service_visible", notification[0], notification[1]]
+      );
+    }
+    await recordAudit(transaction, request.user.id, "service.visibility_changed", "service", service.id, {
+      title: service.title,
+      providerId: service.provider_id,
+      previousHidden: service.hidden_by_admin,
+      hidden: change.hidden,
+      reason: change.reason ?? null,
+    });
+    const { rows } = await transaction.query(
+      `SELECT ${ADMIN_SERVICE_COLUMNS} ${ADMIN_SERVICE_FROM} WHERE service.id=$1`,
+      [service.id]
+    );
+    return rows[0];
+  });
+  response.json(updated);
 }));
 
 adminRouter.get("/audit-events", asyncHandler(async (request, response) => {

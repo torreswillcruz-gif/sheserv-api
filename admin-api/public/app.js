@@ -1,4 +1,4 @@
-// Painel administrativo SheServe: prestadoras, verificações, planos e categorias.
+// Painel administrativo SheServe: prestadoras, verificações, planos, categorias e serviços.
 // Fala só com a própria admin-api (mesma origem). Todo dado vindo da API é
 // inserido com textContent, nunca como HTML.
 (() => {
@@ -216,6 +216,7 @@
     const loadMore = $(".load-more", panel);
     const refreshButton = $(".refresh-button", panel);
     const tabs = $$(".tab", panel);
+    const searchInput = $(".list-search", panel);
 
     function renderEmpty() {
       const empty = document.createElement("p");
@@ -240,7 +241,7 @@
       status.textContent = "Carregando...";
       refreshButton.disabled = true;
       try {
-        const page = await api("GET", path(state.filter, state.offset, PAGE_SIZE));
+        const page = await api("GET", path(state.filter, state.offset, PAGE_SIZE, searchInput?.value.trim() ?? ""));
         const items = page?.items ?? [];
         if (reset && items.length === 0) {
           renderEmpty();
@@ -268,6 +269,12 @@
     });
     refreshButton.addEventListener("click", () => load({ reset: true }));
     loadMore.addEventListener("click", () => load({ reset: false }));
+    // Busca no servidor, esperando a pessoa parar de digitar
+    let searchTimer;
+    searchInput?.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => load({ reset: true }), 300);
+    });
 
     return { load: () => load({ reset: true }) };
   }
@@ -317,6 +324,8 @@
       serviceList.append(item);
     }
 
+    wireFeatureOverrides(card, provider);
+
     if (provider.activationStatus !== "pending") {
       $(".action-approve", card).textContent = "Reativar e aprovar";
       $(".action-reject", card).textContent = "Recusar e remover das buscas";
@@ -334,6 +343,113 @@
       },
     });
     return card;
+  }
+
+  // Recursos da prestadora: o plano decide, e o admin pode liberar (true) ou
+  // bloquear (false) um recurso só para ela. Recurso fora do mapa segue o plano.
+  function wireFeatureOverrides(card, provider) {
+    const section = $(".feature-overrides", card);
+    const table = $(".feature-table", section);
+    const summary = $(".feature-summary", section);
+    const saveButton = $(".feature-save", section);
+    const resetButton = $(".feature-reset", section);
+    const planFeatures = provider.planFeatures ?? {};
+    let saved = { ...(provider.featureOverrides ?? {}) };
+    const selects = new Map();
+    const badges = new Map();
+
+    const choiceOf = (key, overrides) =>
+      key in overrides ? (overrides[key] ? "allow" : "block") : "plan";
+
+    function current() {
+      // Mantém chaves que o painel não lista (recursos novos da API)
+      const next = Object.fromEntries(Object.entries(saved).filter(([key]) => !selects.has(key)));
+      for (const [key, select] of selects) {
+        if (select.value === "allow") next[key] = true;
+        else if (select.value === "block") next[key] = false;
+      }
+      return next;
+    }
+
+    function paintRow(key) {
+      const select = selects.get(key);
+      const row = select.closest(".feature-row");
+      const enabled = select.value === "plan" ? planFeatures[key] === true : select.value === "allow";
+      // setBadge troca a classe inteira: o selo fica guardado no mapa
+      setBadge(badges.get(key), enabled ? "Liberado" : "Bloqueado", enabled ? "active" : "rejected");
+      row.classList.toggle("overridden", select.value !== "plan");
+    }
+
+    function paintSummary() {
+      const overrides = current();
+      const count = Object.keys(overrides).filter((key) => selects.has(key)).length;
+      summary.textContent = count === 0 ? "segue o plano" : `${count} exceção(ões) ao plano`;
+      const dirty = JSON.stringify(overrides) !== JSON.stringify(saved);
+      saveButton.disabled = !dirty;
+      resetButton.hidden = count === 0;
+    }
+
+    for (const [key, label] of PLAN_FEATURES) {
+      const row = document.createElement("div");
+      row.className = "feature-row";
+      row.setAttribute("role", "row");
+      const name = document.createElement("span");
+      name.className = "feature-label";
+      name.setAttribute("role", "cell");
+      name.textContent = label;
+      const inPlan = document.createElement("span");
+      inPlan.className = "muted";
+      inPlan.setAttribute("role", "cell");
+      inPlan.textContent = planFeatures[key] === true ? "Incluído" : "Não incluído";
+      const cell = document.createElement("span");
+      cell.setAttribute("role", "cell");
+      const select = document.createElement("select");
+      select.setAttribute("aria-label", `${label} para ${provider.name}`);
+      fillSelect(select, [
+        ["plan", "Seguir o plano"],
+        ["allow", "Liberar"],
+        ["block", "Bloquear"],
+      ], choiceOf(key, saved));
+      cell.append(select);
+      const result = document.createElement("span");
+      result.setAttribute("role", "cell");
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badges.set(key, badge);
+      result.append(badge);
+      row.append(name, inPlan, cell, result);
+      table.append(row);
+      selects.set(key, select);
+      select.addEventListener("change", () => { paintRow(key); paintSummary(); });
+      paintRow(key);
+    }
+    paintSummary();
+
+    async function save(overrides) {
+      saveButton.disabled = true;
+      resetButton.disabled = true;
+      try {
+        const result = await api("PUT", `/api/v1/admin/providers/${encodeURIComponent(provider.id)}/features`, { overrides });
+        saved = { ...(result?.featureOverrides ?? overrides) };
+        provider.featureOverrides = saved;
+        for (const [key, select] of selects) {
+          select.value = choiceOf(key, saved);
+          paintRow(key);
+        }
+        showToast(`Recursos de ${provider.name} salvos.`);
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+      } finally {
+        resetButton.disabled = false;
+        paintSummary();
+      }
+    }
+
+    saveButton.addEventListener("click", () => save(current()));
+    resetButton.addEventListener("click", () => {
+      if (!window.confirm(`Tirar as exceções de ${provider.name} e seguir só o plano ${provider.planName ?? ""}?`)) return;
+      save(Object.fromEntries(Object.entries(saved).filter(([key]) => !selects.has(key))));
+    });
   }
 
   // ---------- Verificações ----------
@@ -759,6 +875,93 @@
     return { load };
   }
 
+  // ---------- Serviços ----------
+
+  // Oculto pelo admin: sai da busca e dos agendamentos novos do app; a
+  // prestadora continua vendo o serviço, com o motivo.
+  function renderService(service, filter, onRemoved) {
+    const card = cloneTemplate("service-card-template");
+    const hideButton = $(".service-hide", card);
+    const showButton = $(".service-show", card);
+    const hideForm = $(".service-hide-form", card);
+    const reasonInput = $(".service-hide-reason", card);
+    const reason = $(".service-reason", card);
+    // setBadge troca a classe inteira: guarda o selo antes
+    const visibilityBadge = $(".service-visibility", card);
+
+    $(".service-title", card).textContent = service.title;
+    $(".service-provider", card).textContent = [
+      service.providerName,
+      service.providerStatus && service.providerStatus !== "active"
+        ? `prestadora ${PROVIDER_STATUS[service.providerStatus]?.toLowerCase() ?? service.providerStatus}`
+        : null,
+    ].filter(Boolean).join(" · ");
+    $(".service-detail", card).textContent = [
+      serviceDescription({ ...service, category: service.categoryName }),
+      service.categoryActive === false ? "categoria inativa" : null,
+      `cadastrado em ${formatDate(service.createdAt)}`,
+    ].filter(Boolean).join(" · ");
+
+    function paint(current) {
+      setBadge(
+        visibilityBadge,
+        current.hiddenByAdmin ? "Oculto" : "Visível",
+        current.hiddenByAdmin ? "rejected" : "active",
+      );
+      reason.hidden = !current.hiddenByAdmin || !current.hiddenReason;
+      reason.textContent = current.hiddenReason ? `Motivo: ${current.hiddenReason}` : "";
+      hideButton.hidden = current.hiddenByAdmin;
+      showButton.hidden = !current.hiddenByAdmin;
+      hideForm.hidden = true;
+    }
+    paint(service);
+
+    async function send(body, buttons) {
+      buttons.forEach((button) => { button.disabled = true; });
+      try {
+        const updated = await api(
+          "PATCH",
+          `/api/v1/admin/services/${encodeURIComponent(service.id)}/visibility`,
+          body,
+        );
+        showToast(body.hidden
+          ? `${service.title} foi ocultado. ${service.providerName} será avisada.`
+          : `${service.title} voltou a aparecer no app.`);
+        // Na aba filtrada, o serviço que mudou de situação sai da lista
+        if (filter !== "all") {
+          card.remove();
+          onRemoved();
+        } else {
+          Object.assign(service, updated ?? { hiddenByAdmin: body.hidden, hiddenReason: body.reason ?? null });
+          paint(service);
+        }
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+      } finally {
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+    }
+
+    hideButton.addEventListener("click", () => {
+      hideForm.hidden = false;
+      hideButton.hidden = true;
+      reasonInput.focus();
+    });
+    $(".service-hide-cancel", card).addEventListener("click", () => paint(service));
+    hideForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const text = reasonInput.value.trim();
+      if (!text) {
+        reasonInput.focus();
+        showToast("Informe o motivo para ocultar.", true);
+        return;
+      }
+      send({ hidden: true, reason: text }, $$("button", hideForm));
+    });
+    showButton.addEventListener("click", () => send({ hidden: false }, [showButton]));
+    return card;
+  }
+
   // ---------- Seções ----------
 
   const panels = Object.fromEntries($$("[data-section-panel]").map((panel) => [panel.dataset.sectionPanel, panel]));
@@ -789,6 +992,19 @@
     }),
     plans: createPlansSection(panels.plans),
     categories: createCategoriesSection(panels.categories),
+    services: createListSection({
+      panel: panels.services,
+      initialFilter: "all",
+      path: (filter, offset, limit, query) => `/api/v1/admin/services?${new URLSearchParams({
+        visibility: filter, limit, offset, ...(query ? { query } : {}),
+      })}`,
+      renderItem: renderService,
+      emptyMessages: {
+        all: "Nenhum serviço encontrado.",
+        visible: "Nenhum serviço visível encontrado.",
+        hidden: "Nenhum serviço oculto.",
+      },
+    }),
   };
   const loaded = new Set();
 

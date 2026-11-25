@@ -100,7 +100,7 @@ const PROVIDER_SELECT_SQL = `
     CASE WHEN provider_venue.provider_id IS NOT NULL AND EXISTS (
            SELECT 1 FROM services venue_service
            WHERE venue_service.provider_id = provider_user.id
-             AND venue_service.active
+             AND venue_service.active AND NOT venue_service.hidden_by_admin
              AND venue_service.service_location = 'at_provider')
       THEN json_build_object(
         'latitude', ROUND(provider_venue.latitude::numeric, 2)::float,
@@ -128,7 +128,7 @@ const PROVIDER_SELECT_SQL = `
       FROM services listed_service
       JOIN categories service_category ON service_category.id = listed_service.category_id
       WHERE listed_service.provider_id = provider_user.id
-        AND listed_service.active
+        AND listed_service.active AND NOT listed_service.hidden_by_admin
         AND ($1::text IS NULL OR listed_service.category_id = $1::text)
     ), '[]') AS services
   FROM provider_profiles provider_profile
@@ -147,7 +147,9 @@ const PROVIDER_SELECT_SQL = `
     JOIN plan_catalog brand_plan ON brand_plan.plan_code = COALESCE(
       (SELECT plan_name FROM provider_plans WHERE provider_id = provider_user.id), 'free')
     WHERE branding.provider_id = provider_user.id
-      AND COALESCE(brand_plan.features->>'branding', 'false') = 'true'
+      AND COALESCE((brand_plan.features || COALESCE(
+            (SELECT overrides FROM provider_feature_overrides WHERE provider_id = provider_user.id),
+            '{}'::jsonb))->>'branding', 'false') = 'true'
   ) provider_brand ON true`;
 
 catalogRouter.get("/providers", asyncHandler(async (request, response) => {
@@ -167,12 +169,12 @@ catalogRouter.get("/providers", asyncHandler(async (request, response) => {
             OR provider_brand.brand_name ILIKE '%' || $4::text || '%'
             OR EXISTS (SELECT 1 FROM services matching_service
                        WHERE matching_service.provider_id = provider_user.id
-                         AND matching_service.active
+                         AND matching_service.active AND NOT matching_service.hidden_by_admin
                          AND matching_service.title ILIKE '%' || $4::text || '%'))
        AND ($1::text IS NULL
             OR EXISTS (SELECT 1 FROM services category_service
                        WHERE category_service.provider_id = provider_user.id
-                         AND category_service.active
+                         AND category_service.active AND NOT category_service.hidden_by_admin
                          AND category_service.category_id = $1::text))
        AND ($5::timestamptz IS NULL
             OR NOT EXISTS (SELECT 1 FROM orders existing_order
@@ -184,7 +186,7 @@ catalogRouter.get("/providers", asyncHandler(async (request, response) => {
        AND ($7::text IS NULL
             OR EXISTS (SELECT 1 FROM services location_service
                        WHERE location_service.provider_id = provider_user.id
-                         AND location_service.active
+                         AND location_service.active AND NOT location_service.hidden_by_admin
                          AND location_service.service_location = $7::text))
      ${orderByClause}
      LIMIT 50`,

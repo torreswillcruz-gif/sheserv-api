@@ -69,7 +69,9 @@ describe("branding", () => {
     await server.call("GET", "/api/v1/providers?query=studio");
     const [query] = queriesMatching(/FROM provider_profiles provider_profile/);
     assert.match(query.sql, /provider_brand\.brand_name AS "brandName"/);
-    assert.match(query.sql, /features->>'branding'/);
+    assert.match(query.sql, /->>'branding'/);
+    // a exceção do admin para a prestadora vale por cima do plano
+    assert.match(query.sql, /brand_plan\.features \|\| COALESCE\( \(SELECT overrides FROM provider_feature_overrides/);
     assert.match(query.sql, /OR provider_brand\.brand_name ILIKE/);
   });
 });

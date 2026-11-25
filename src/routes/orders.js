@@ -116,7 +116,7 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
       `SELECT service.*, provider_profile.activation_status
        FROM services service
        JOIN provider_profiles provider_profile ON provider_profile.user_id = service.provider_id
-       WHERE service.id = $1 AND service.active`,
+       WHERE service.id = $1 AND service.active AND NOT service.hidden_by_admin`,
       [orderRequest.serviceId]
     );
     const service = matchingServices[0];
@@ -257,7 +257,7 @@ ordersRouter.get("/services/:id/slots", asyncHandler(async (request, response) =
     `SELECT service.id, service.provider_id, service.duration_minutes, service.availability
      FROM services service
      JOIN provider_profiles provider_profile ON provider_profile.user_id = service.provider_id
-     WHERE service.id = $1 AND service.active AND provider_profile.activation_status = 'active'`,
+     WHERE service.id = $1 AND service.active AND NOT service.hidden_by_admin AND provider_profile.activation_status = 'active'`,
     [request.params.id]
   );
   const service = services[0];

@@ -37,6 +37,7 @@
         <button type="button" class="section-link" data-section="verifications">Verificações</button>
         <button type="button" class="section-link" data-section="plans">Planos</button>
         <button type="button" class="section-link" data-section="categories">Categorias</button>
+        <button type="button" class="section-link" data-section="services">Serviços</button>
       </nav>
       <div class="topbar-user">
         <span id="admin-name" class="muted"></span>
@@ -115,6 +116,29 @@
       <p class="list-status muted" role="status"></p>
       <section class="item-list category-list" aria-live="polite"></section>
     </main>
+
+    <!-- Serviços -->
+    <main class="content" data-section-panel="services" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Serviços no app</h1>
+          <p class="muted">Oculte um serviço para tirá-lo da busca e dos agendamentos sem apagá-lo. A prestadora é avisada com o motivo; pedidos já feitos continuam valendo.</p>
+        </div>
+        <button type="button" class="button ghost refresh-button">Atualizar</button>
+      </div>
+      <nav class="tabs" aria-label="Filtrar serviços por visibilidade">
+        <button type="button" class="tab" data-filter="all" aria-pressed="true">Todos</button>
+        <button type="button" class="tab" data-filter="visible" aria-pressed="false">Visíveis</button>
+        <button type="button" class="tab" data-filter="hidden" aria-pressed="false">Ocultos</button>
+      </nav>
+      <label class="category-search-label">
+        <span class="visually-hidden">Buscar serviço, prestadora ou categoria</span>
+        <input class="list-search" type="search" placeholder="Buscar por serviço, prestadora ou categoria" autocomplete="off">
+      </label>
+      <p class="list-status muted" role="status"></p>
+      <section class="item-list" aria-live="polite"></section>
+      <div class="list-footer"><button type="button" class="button ghost load-more" hidden>Carregar mais</button></div>
+    </main>
   </div>
 
   <div id="toast" class="toast" role="status" hidden></div>
@@ -145,6 +169,25 @@
         <h3 class="card-services-title"></h3>
         <ul class="card-services"></ul>
       </div>
+      <details class="card-section feature-overrides">
+        <summary>
+          <span>Recursos desta prestadora</span>
+          <span class="muted feature-summary"></span>
+        </summary>
+        <p class="muted feature-hint">Por padrão vale o que o plano inclui. Libere ou bloqueie um recurso só para esta prestadora; a mudança vale na hora no app.</p>
+        <div class="feature-table" role="table" aria-label="Recursos da prestadora">
+          <div class="feature-row feature-head" role="row">
+            <span role="columnheader">Recurso</span>
+            <span role="columnheader">No plano</span>
+            <span role="columnheader">Para esta prestadora</span>
+            <span role="columnheader">Resultado</span>
+          </div>
+        </div>
+        <div class="card-actions">
+          <button type="button" class="button primary feature-save">Salvar recursos</button>
+          <button type="button" class="button ghost feature-reset">Seguir só o plano</button>
+        </div>
+      </details>
       <div class="card-actions">
         <button type="button" class="button primary action-approve">Aprovar</button>
         <button type="button" class="button danger-outline action-reject">Recusar</button>
@@ -302,6 +345,36 @@
         <button type="button" class="button ghost category-edit">Editar</button>
       </div>
     </div>
+  </template>
+  <!-- Modelo: serviço com a chave de visibilidade -->
+  <template id="service-card-template">
+    <article class="card service-card">
+      <div class="category-row">
+        <div class="category-row-main">
+          <div class="category-row-title">
+            <strong class="service-title"></strong>
+            <span class="badge service-visibility"></span>
+          </div>
+          <p class="card-meta muted service-provider"></p>
+          <p class="card-meta muted service-detail"></p>
+          <p class="card-meta service-reason" hidden></p>
+        </div>
+        <div class="card-actions">
+          <button type="button" class="button ghost service-hide">Ocultar</button>
+          <button type="button" class="button primary service-show" hidden>Mostrar no app</button>
+        </div>
+      </div>
+      <form class="reject-form service-hide-form" hidden>
+        <label>
+          <span>Motivo (a prestadora vê esta mensagem)</span>
+          <textarea class="reject-reason service-hide-reason" rows="2" maxlength="500" required></textarea>
+        </label>
+        <div class="card-actions">
+          <button type="submit" class="button danger">Ocultar serviço</button>
+          <button type="button" class="button ghost service-hide-cancel">Cancelar</button>
+        </div>
+      </form>
+    </article>
   </template>
 </body>
 </html>

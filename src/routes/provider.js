@@ -215,7 +215,8 @@ const SERVICE_COLUMNS = `id, category_id AS "categoryId",
   duration_minutes AS "durationMinutes", service_location AS "serviceLocation",
   price_type AS "priceType", accepts_quotes AS "acceptsQuotes",
   briefing_questions AS "briefingQuestions", cancellation_policy AS "cancellationPolicy",
-  availability, active`;
+  availability, active,
+  hidden_by_admin AS "hiddenByAdmin", hidden_reason AS "hiddenReason"`;
 
 const serviceSchema = z.object({
   categoryId: z.string().min(1).max(100),

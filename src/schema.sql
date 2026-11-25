@@ -183,6 +183,11 @@ CREATE INDEX IF NOT EXISTS idx_addresses_user ON addresses(user_id);
 ALTER TABLE services ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
 CREATE INDEX IF NOT EXISTS idx_services_provider ON services(provider_id);
 
+-- serviço oculto pelo painel admin (moderação): some da busca e não recebe
+-- agendamentos novos, mas continua na lista da prestadora com o aviso
+ALTER TABLE services ADD COLUMN IF NOT EXISTS hidden_by_admin boolean NOT NULL DEFAULT false;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS hidden_reason text;
+
 -- localização base da prestadora (usada só para calcular distância; nunca exposta no catálogo)
 ALTER TABLE provider_profiles ADD COLUMN IF NOT EXISTS latitude double precision;
 ALTER TABLE provider_profiles ADD COLUMN IF NOT EXISTS longitude double precision;
@@ -673,3 +678,12 @@ UPDATE plan_catalog SET features = features || jsonb_build_object('invoices', pl
 WHERE NOT features ? 'invoices';
 UPDATE plan_catalog SET features = features || jsonb_build_object('custom_quotes', plan_code IN ('pro','premium'))
 WHERE NOT features ? 'custom_quotes';
+
+-- Exceções por prestadora definidas no painel admin: {"finance": true} libera
+-- um recurso que o plano não tem; {"team": false} bloqueia um que o plano tem.
+-- Chave ausente = segue o plano. Os recursos valem plan_catalog.features || overrides.
+CREATE TABLE IF NOT EXISTS provider_feature_overrides (
+  provider_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  overrides jsonb NOT NULL DEFAULT '{}'::jsonb,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);

@@ -6,10 +6,15 @@ const { requireRole } = require("../security");
 
 erpRouter.use(requireRole("prestadora"));
 
+// Recursos que valem para a prestadora: os do plano com as exceções que o
+// admin definiu para ela por cima (provider_feature_overrides).
+const PROVIDER_OVERRIDES_SQL = `COALESCE(
+  (SELECT overrides FROM provider_feature_overrides WHERE provider_id=$1),'{}'::jsonb)`;
+
 function requirePlanFeature(featureName) {
   return asyncHandler(async (request, _response, next) => {
     const { rows } = await runQuery(
-      `SELECT COALESCE(plan_catalog.features->$2,'false'::jsonb)='true'::jsonb AS enabled
+      `SELECT COALESCE((plan_catalog.features || ${PROVIDER_OVERRIDES_SQL})->$2,'false'::jsonb)='true'::jsonb AS enabled
        FROM plan_catalog
        WHERE plan_code=COALESCE(
          (SELECT plan_name FROM provider_plans WHERE provider_id=$1),'free'
@@ -27,7 +32,9 @@ erpRouter.get("/me/plan", asyncHandler(async (request, response) => {
   const [plan, availablePlans, usage, purchases, stats] = await Promise.all([
     runQuery(
       `SELECT plan_code AS plan,display_name AS "displayName",description,
-        monthly_approval_limit AS "approvalLimit",features,active
+        monthly_approval_limit AS "approvalLimit",
+        features || ${PROVIDER_OVERRIDES_SQL} AS features,
+        ${PROVIDER_OVERRIDES_SQL} AS "featureOverrides",active
        FROM plan_catalog
        WHERE plan_code=COALESCE(
          (SELECT plan_name FROM provider_plans WHERE provider_id=$1),'free'
@@ -50,6 +57,8 @@ erpRouter.get("/me/plan", asyncHandler(async (request, response) => {
     description: plan.rows[0]?.description ?? null,
     approvalLimit: plan.rows[0] ? plan.rows[0].approvalLimit : 20,
     features: plan.rows[0]?.features ?? { team: false },
+    // O que o admin liberou (true) ou bloqueou (false) só para esta prestadora
+    featureOverrides: plan.rows[0]?.featureOverrides ?? {},
     availablePlans: availablePlans.rows,
     approved: usage.rows[0]?.approved_count ?? 0,
     reserved: usage.rows[0]?.reserved_count ?? 0,

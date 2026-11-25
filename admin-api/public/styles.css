@@ -323,3 +323,15 @@ label.check input { width: 18px; height: 18px; accent-color: var(--primary); }
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
+.service-reason { color: var(--error); }
+
+/* Recursos por prestadora (exceções ao plano) */
+.feature-overrides summary { cursor: pointer; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; font-weight: 600; color: var(--wine); }
+.feature-overrides[open] summary { margin-bottom: 8px; }
+.feature-hint { margin: 0 0 10px; font-size: 0.9rem; }
+.feature-table { display: grid; gap: 4px; margin-bottom: 12px; }
+.feature-row { display: grid; grid-template-columns: minmax(140px, 1.4fr) 0.8fr minmax(150px, 1.2fr) 0.8fr; gap: 12px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.feature-head { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted, #8a5a6a); border-bottom-width: 2px; }
+.feature-row select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; background: #fff; font: inherit; }
+.feature-row.overridden .feature-label { font-weight: 600; }
+@media (max-width: 640px) { .feature-row { grid-template-columns: 1fr 1fr; } }

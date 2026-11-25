@@ -106,9 +106,23 @@ shape.
     otherwise `409 category_in_use`.
   - Icon keys live in `CATEGORY_ICONS` (`src/routes/admin.js`) and must also
     exist in the app's `ServiceCategoryTile`.
+- `PUT /api/v1/admin/providers/{providerId}/features`
+  - Body: `{"overrides":{"inventory":true,"team":false}}`. Exceptions for one
+    provider on top of the plan: `true` releases, `false` blocks, a missing key
+    follows the plan. The map replaces the previous one (`{}` = plan only).
+  - Stored in `provider_feature_overrides`; `GET /admin/providers` returns
+    `planFeatures` and `featureOverrides`.
+- `GET /api/v1/admin/services?visibility=all|visible|hidden&query=&limit=&offset=`
+  - Services not deleted by the provider; `query` matches title, provider or
+    category.
+- `PATCH /api/v1/admin/services/{serviceId}/visibility`
+  - Body: `{"hidden":true,"reason":"..."}` (reason required) or
+    `{"hidden":false}`. Hidden services leave the app search and take no new
+    bookings; the provider is notified with the reason.
 - `GET /api/v1/admin/audit-events?limit=50&offset=0`
 
-Every approval, plan edit, assignment, and category change is written to
+Every approval, plan edit, assignment, feature exception, service visibility
+change, and category change is written to
 `admin_audit_events`. The plan catalog is shared with the marketplace API.
 Monthly quote limits and the `finance`, `inventory`, `clients`, `statistics`,
 `promotions`, `team`, `branding`, `invoices`, and `custom_quotes` features are enforced by the API and reflected in the provider app.
