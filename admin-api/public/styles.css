@@ -286,4 +286,40 @@ label.check input { width: 18px; height: 18px; accent-color: var(--primary); }
 /* Categorias: o formulário de criação fica acima da lista */
 .new-category { margin-bottom: 20px; }
 .category-card { align-content: start; }
-.category-card select { width: 100%; }
+.category-card select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+  color: var(--text);
+  background: #fff;
+}
+.category-card select:disabled { background: var(--background); color: var(--muted); }
+
+/* Categorias: lista com principais e subcategorias, edição no lugar e busca */
+.category-search-label { display: block; margin-bottom: 16px; }
+.category-search { width: 100%; }
+.category-group { gap: 0; padding: 8px 20px; }
+.category-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  flex-wrap: wrap;
+}
+.category-row-main { min-width: 0; }
+.category-row-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.category-children { display: grid; border-top: 1px solid var(--border); }
+.category-children:empty { border-top: 0; }
+.category-children > .category-row,
+.category-children > .category-card { margin-left: 24px; }
+.category-children > .category-row + .category-row { border-top: 1px dashed var(--border); }
+.category-children > .category-row .category-row-name::before { content: "↳ "; color: var(--muted); }
+.category-group > div > .category-card,
+.category-children > .category-card { margin: 12px 0; box-shadow: none; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}

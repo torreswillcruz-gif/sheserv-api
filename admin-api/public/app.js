@@ -514,41 +514,68 @@
     return error.message;
   }
 
+  // Busca sem acento e sem diferença de maiúsculas: "pos obra" acha "Pós-obra".
+  function searchKey(text) {
+    return String(text ?? "")
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  // Lista as principais com as subcategorias embaixo. Cada linha tem "Editar",
+  // que abre o formulário no lugar; as principais têm "+ Subcategoria".
+  // A busca filtra por nome ou identificador sem recarregar.
   function createCategoriesSection(panel) {
     const list = $(".item-list", panel);
     const status = $(".list-status", panel);
     const newSlot = $(".new-category", panel);
     const refreshButton = $(".refresh-button", panel);
+    const newButton = $(".category-new-button", panel);
+    const searchInput = $(".category-search", panel);
     let categories = [];
     let icons = Object.keys(CATEGORY_ICON_LABELS);
 
     const nameOf = (id) => categories.find((category) => category.id === id)?.name ?? id;
+    const childrenOf = (id) => categories.filter((category) => category.parentId === id);
 
-    // `null` monta o formulário de criação.
-    function renderCategory(category) {
+    // `category` null monta o formulário de criação; `parentId` já deixa
+    // escolhida a principal (botão "+ Subcategoria").
+    function renderCategoryForm(category, { parentId = null, onCancel } = {}) {
       const form = cloneTemplate("category-form-template");
       const isNew = category === null;
       const nameInput = $(".category-name", form);
       const idInput = $(".category-id", form);
+      const parentSelect = $(".category-parent", form);
       const deleteButton = $(".category-delete", form);
       // Só categorias principais podem receber subcategorias (dois níveis)
       const roots = categories.filter((item) => item.parentId === null && item.id !== category?.id);
+      const parentIcon = categories.find((item) => item.id === parentId)?.icon;
 
-      $(".category-title", form).textContent = isNew ? "Nova categoria" : category.name;
+      $(".category-title", form).textContent = isNew
+        ? (parentId ? `Nova subcategoria de ${nameOf(parentId)}` : "Nova categoria")
+        : `Editar ${category.parentId ? "subcategoria" : "categoria"}: ${category.name}`;
       nameInput.value = category?.name ?? "";
       idInput.value = category?.id ?? "";
       idInput.disabled = !isNew;
       fillSelect(
         $(".category-icon", form),
         icons.map((key) => [key, CATEGORY_ICON_LABELS[key] ?? key]),
-        category?.icon ?? "general",
+        category?.icon ?? parentIcon ?? "general",
       );
       fillSelect(
-        $(".category-parent", form),
+        parentSelect,
         [["", "— nenhuma —"], ...roots.map((root) => [root.id, root.name])],
-        category?.parentId ?? "",
+        category?.parentId ?? parentId ?? "",
       );
-      $(".category-order", form).value = category?.sortOrder ?? 0;
+      // Quem já tem subcategorias não pode virar subcategoria (a API também barra).
+      if (category?.childCount > 0) {
+        parentSelect.disabled = true;
+        parentSelect.parentElement.querySelector(".hint").textContent = "Tem subcategorias, por isso continua como categoria principal.";
+      }
+      // Subcategoria nova entra depois das que a principal já tem.
+      $(".category-order", form).value = category?.sortOrder ?? (parentId ? childrenOf(parentId).length + 1 : 0);
       $(".category-active", form).checked = category?.active ?? true;
 
       if (isNew) {
@@ -578,6 +605,8 @@
         deleteButton.hidden = inUse;
       }
 
+      $(".category-cancel", form).addEventListener("click", () => onCancel?.());
+
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         const name = nameInput.value.trim();
@@ -598,7 +627,7 @@
         const body = {
           name,
           icon: $(".category-icon", form).value,
-          parentId: $(".category-parent", form).value || null,
+          parentId: parentSelect.value || null,
           sortOrder: order,
           active: $(".category-active", form).checked,
         };
@@ -608,6 +637,7 @@
           if (isNew) {
             await api("POST", "/api/v1/admin/categories", { id, ...body });
             showToast(`Categoria ${name} criada.`);
+            newSlot.replaceChildren();
           } else {
             await api("PUT", `/api/v1/admin/categories/${encodeURIComponent(category.id)}`, body);
             showToast(`Categoria ${name} salva.`);
@@ -635,6 +665,75 @@
       return form;
     }
 
+    // Linha da lista; "Editar" troca a linha pelo formulário e "Cancelar" volta.
+    function renderCategoryRow(category, group) {
+      const row = cloneTemplate("category-row-template");
+      $(".category-row-name", row).textContent = category.name;
+      setBadge(
+        $(".category-row-status", row),
+        category.active ? "Ativa" : "Inativa",
+        category.active ? "active" : "rejected",
+      );
+      $(".category-row-meta", row).textContent = [
+        category.id,
+        `ícone ${CATEGORY_ICON_LABELS[category.icon] ?? category.icon}`,
+        `ordem ${category.sortOrder}`,
+        `${category.activeServiceCount} serviço(s) ativo(s)`,
+        category.childCount > 0 ? `${category.childCount} subcategoria(s)` : null,
+      ].filter(Boolean).join(" · ");
+
+      $(".category-edit", row).addEventListener("click", () => {
+        const form = renderCategoryForm(category, { onCancel: () => form.replaceWith(row) });
+        row.replaceWith(form);
+        $(".category-name", form).focus();
+      });
+
+      const addChild = $(".category-add-child", row);
+      if (category.parentId === null) {
+        addChild.hidden = false;
+        addChild.addEventListener("click", () => {
+          const children = $(".category-children", group);
+          const form = renderCategoryForm(null, { parentId: category.id, onCancel: () => form.remove() });
+          children.append(form);
+          $(".category-name", form).focus();
+        });
+      }
+      return row;
+    }
+
+    // A principal aparece se ela ou alguma subcategoria casa com a busca. Se a
+    // principal casa, mostra todas as subcategorias; senão, só as que casam.
+    function renderList() {
+      const query = searchKey(searchInput.value);
+      const matches = (category) => !query
+        || searchKey(category.name).includes(query)
+        || searchKey(category.id).includes(query);
+      const roots = categories.filter((category) => category.parentId === null);
+      // Subcategoria cuja principal não veio na lista vira um grupo próprio.
+      const orphans = categories.filter((category) =>
+        category.parentId !== null && !categories.some((root) => root.id === category.parentId));
+
+      const groups = [];
+      let found = 0;
+      for (const root of [...roots, ...orphans]) {
+        const children = root.parentId === null ? childrenOf(root.id) : [];
+        const rootMatches = matches(root);
+        const matchingChildren = children.filter(matches);
+        if (!rootMatches && matchingChildren.length === 0) continue;
+        found += (rootMatches ? 1 : 0) + matchingChildren.length;
+        const group = cloneTemplate("category-group-template");
+        $(".category-root", group).append(renderCategoryRow(root, group));
+        const visibleChildren = rootMatches ? children : matchingChildren;
+        $(".category-children", group).append(...visibleChildren.map((child) => renderCategoryRow(child, group)));
+        groups.push(group);
+      }
+      list.replaceChildren(...groups);
+      if (!categories.length) status.textContent = "Nenhuma categoria cadastrada ainda.";
+      else if (!query) status.textContent = "";
+      else if (!found) status.textContent = `Nenhuma categoria encontrada para “${searchInput.value.trim()}”.`;
+      else status.textContent = `${found} categoria(s) encontrada(s).`;
+    }
+
     async function load() {
       status.textContent = "Carregando...";
       refreshButton.disabled = true;
@@ -642,20 +741,20 @@
         const result = await api("GET", "/api/v1/admin/categories");
         categories = result?.items ?? [];
         if (Array.isArray(result?.icons) && result.icons.length) icons = result.icons;
-        // Principais na ordem definida, cada uma seguida das suas subcategorias
-        const ordered = categories
-          .filter((category) => category.parentId === null)
-          .flatMap((root) => [root, ...categories.filter((category) => category.parentId === root.id)]);
-        const orphans = categories.filter((category) => !ordered.includes(category));
-        newSlot.replaceChildren(renderCategory(null));
-        list.replaceChildren(...[...ordered, ...orphans].map(renderCategory));
-        status.textContent = categories.length ? "" : "Nenhuma categoria cadastrada ainda.";
+        renderList();
       } catch (error) {
         if (error.status !== 401) status.textContent = `Não foi possível carregar: ${error.message}`;
       } finally {
         refreshButton.disabled = false;
       }
     }
+
+    newButton.addEventListener("click", () => {
+      const form = renderCategoryForm(null, { onCancel: () => newSlot.replaceChildren() });
+      newSlot.replaceChildren(form);
+      $(".category-name", form).focus();
+    });
+    searchInput.addEventListener("input", renderList);
     refreshButton.addEventListener("click", load);
     return { load };
   }

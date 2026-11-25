@@ -102,11 +102,18 @@
           <h1>Categorias de serviço</h1>
           <p class="muted">Aparecem no app na ordem definida aqui. Desative para tirar uma categoria do app sem afetar os serviços que já a usam.</p>
         </div>
-        <button type="button" class="button ghost refresh-button">Atualizar</button>
+        <div class="card-actions">
+          <button type="button" class="button primary category-new-button">Nova categoria</button>
+          <button type="button" class="button ghost refresh-button">Atualizar</button>
+        </div>
       </div>
+      <label class="category-search-label">
+        <span class="visually-hidden">Buscar categoria ou subcategoria</span>
+        <input class="category-search" type="search" placeholder="Buscar categoria ou subcategoria (nome ou identificador)" autocomplete="off">
+      </label>
       <section class="new-category"></section>
       <p class="list-status muted" role="status"></p>
-      <section class="item-list plan-grid" aria-live="polite"></section>
+      <section class="item-list category-list" aria-live="polite"></section>
     </main>
   </div>
 
@@ -266,9 +273,35 @@
       <p class="hint category-usage"></p>
       <div class="card-actions">
         <button type="submit" class="button primary category-save">Salvar categoria</button>
+        <button type="button" class="button ghost category-cancel">Cancelar</button>
         <button type="button" class="button danger-outline category-delete" hidden>Excluir</button>
       </div>
     </form>
+  </template>
+
+  <!-- Modelo: categoria principal com as subcategorias -->
+  <template id="category-group-template">
+    <article class="card category-group">
+      <div class="category-root"></div>
+      <div class="category-children"></div>
+    </article>
+  </template>
+
+  <!-- Modelo: linha de uma categoria ou subcategoria na lista -->
+  <template id="category-row-template">
+    <div class="category-row">
+      <div class="category-row-main">
+        <div class="category-row-title">
+          <strong class="category-row-name"></strong>
+          <span class="badge category-row-status"></span>
+        </div>
+        <p class="card-meta muted category-row-meta"></p>
+      </div>
+      <div class="card-actions">
+        <button type="button" class="button ghost category-add-child" hidden>+ Subcategoria</button>
+        <button type="button" class="button ghost category-edit">Editar</button>
+      </div>
+    </div>
   </template>
 </body>
 </html>
