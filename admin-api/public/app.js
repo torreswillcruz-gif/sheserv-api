@@ -25,7 +25,6 @@
     ["team", "Equipe"],
     ["branding", "Perfil da marca"],
     ["invoices", "Notas fiscais"],
-    ["custom_quotes", "Orçamento livre"],
   ];
   const LOCATION_LABELS = { at_customer: "vai até a cliente", at_provider: "recebe no espaço" };
   const ERROR_MESSAGES = {
