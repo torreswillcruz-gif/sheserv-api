@@ -1,7 +1,7 @@
 # Imagem da marketplace-api
 # Build:  docker build -t sheserve-api .
 # Run:    docker run --init -p 3000:3000 --env-file .env sheserve-api
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 
 ENV NODE_ENV=production \
     PORT=3000

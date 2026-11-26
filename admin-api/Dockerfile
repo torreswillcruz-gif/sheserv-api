@@ -1,7 +1,7 @@
 # Imagem da sheserve-admin-api
 # Build:  docker build -t sheserve-admin-api ./admin-api
 # Run:    docker run --init -p 3001:3001 --env-file .env sheserve-admin-api
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 
 ENV NODE_ENV=production \
     PORT=3001
