@@ -664,7 +664,20 @@ erpRouter.post("/me/purchases", asyncHandler(async (request, response) => {
     //      (init_point) para o app abrir — SEM chamar activateSubscription aqui.
     // A ativação passa para o webhook abaixo, depois que o gateway confirmar
     // o pagamento (status "approved"/"authorized").
-    // Enquanto não há gateway, o plano é ativado direto:
+    // Camadas Free/Standard/Pro: a mensalidade é descontada dos repasses
+    // (módulo de pagamentos), nunca cobrada antes. Downgrade não cancela
+    // assinatura de ninguém: só bloqueia novas até caber no limite.
+    if (["free", "standard", "pro"].includes(data.plan)) {
+      const { changeTier } = require("../payments/accounts");
+      await changeTier(transaction, request.user.id, data.plan);
+      await transaction.query("UPDATE plan_purchases SET status='active',paid_at=now() WHERE id=$1", [purchase.id]);
+      const { rows: plans } = await transaction.query(
+        `SELECT plan_name AS "planCode",monthly_approval_limit AS "monthlyApprovalLimit",renewal_at AS "renewalAt"
+         FROM provider_plans WHERE provider_id=$1`,
+        [request.user.id]
+      );
+      return { ...purchase, status: "active", plan: plans[0] };
+    }
     const plan = await activateSubscription(transaction, {
       providerId: request.user.id,
       purchaseId: purchase.id,

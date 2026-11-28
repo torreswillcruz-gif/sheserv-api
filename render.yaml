@@ -19,6 +19,10 @@ services:
       # desligado e os avisos ficam só no sino do app.
       - key: FIREBASE_SERVICE_ACCOUNT
         sync: false
+      # Gateway de pagamento. "mock" = modo demonstração (nenhuma cobrança
+      # real). Para o Pagar.me, ver src/payments/README.md.
+      - key: PAYMENT_GATEWAY
+        value: mock
   - type: web
     name: sheserve-admin-api
     runtime: node
@@ -38,3 +42,6 @@ services:
       # (ex.: https://sheserv-api.onrender.com)
       - key: MARKETPLACE_API_URL
         sync: false
+      # Só para o painel mostrar o gateway ativo (o mesmo da marketplace-api)
+      - key: PAYMENT_GATEWAY
+        value: mock

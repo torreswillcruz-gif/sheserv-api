@@ -13,6 +13,9 @@ const {
   slotsForDay,
 } = require("../schedule");
 const { formatWhen, notify, userName } = require("../notifications");
+const payments = require("../payments/charges");
+const { debitEntitlement } = require("../payments/subscriptions");
+const { fingerprint, assertSameRequest, decimalFromCents } = require("../payments/runtime");
 
 const roundToTwoDecimals = (value) => Math.round(value * 100) / 100;
 
@@ -42,7 +45,11 @@ const ORDER_SELECT_SQL = `
     orders.customer_id AS "customerId",
     customer_user.name AS "customerName",
     orders.scheduled_at AS "scheduledAt",
-    orders.total_amount::float AS "totalAmount",
+    -- a cliente vê o total que paga (taxa embutida, nunca em linha separada);
+    -- a prestadora vê o preço dela
+    CASE WHEN orders.customer_id = $1 AND order_charge.id IS NOT NULL
+      THEN order_charge.total_cents / 100.0
+      ELSE orders.total_amount::float END AS "totalAmount",
     orders.commission::float AS commission,
     orders.service_location AS "serviceLocation",
     orders.cancellation_reason AS "cancellationReason",
@@ -69,18 +76,41 @@ const ORDER_SELECT_SQL = `
         'longitude', order_venue.longitude
       )
     END AS venue,
-    json_build_object(
-      'id', payments.id,
-      'status', payments.status,
-      'method', payments.method,
-      'heldUntil', payments.held_until
-    ) AS payment
+    CASE
+      WHEN order_charge.id IS NOT NULL THEN json_build_object(
+        'id', order_charge.id,
+        'status', order_charge.status,
+        'method', CASE order_charge.payment_method WHEN 'cartao' THEN 'card' ELSE 'pix' END,
+        'inApp', true,
+        'pixCopyPaste', CASE WHEN orders.customer_id = $1 AND order_charge.status IN ('pendente','processando')
+                          THEN order_charge.pix_copy_paste END,
+        'refundedCents', order_charge.refunded_cents)
+      WHEN order_usage.id IS NOT NULL THEN json_build_object(
+        'id', order_usage.id,
+        'status', order_usage.status,
+        'method', 'subscription',
+        'subscriptionId', order_usage.subscription_id)
+      ELSE json_build_object(
+        'id', payments.id,
+        'status', payments.status,
+        'method', payments.method,
+        'heldUntil', payments.held_until)
+    END AS payment
   FROM orders
   JOIN users customer_user ON customer_user.id = orders.customer_id
   JOIN users provider_user ON provider_user.id = orders.provider_id
   LEFT JOIN addresses order_address ON order_address.id = orders.address_id
   LEFT JOIN provider_venues order_venue ON order_venue.provider_id = orders.provider_id
-  LEFT JOIN payments ON payments.order_id = orders.id`;
+  LEFT JOIN payments ON payments.order_id = orders.id
+  LEFT JOIN LATERAL (
+    SELECT id, status, payment_method, total_cents, pix_copy_paste, refunded_cents
+    FROM charges WHERE charges.order_id = orders.id ORDER BY created_at DESC LIMIT 1
+  ) order_charge ON true
+  LEFT JOIN LATERAL (
+    SELECT usage.id, usage.status, entitlement.subscription_id
+    FROM entitlement_usages usage JOIN entitlements entitlement ON entitlement.id = usage.entitlement_id
+    WHERE usage.order_id = orders.id
+  ) order_usage ON true`;
 
 // Busca o pedido e garante que quem pediu é o cliente ou a prestadora dele
 async function loadOrderForParticipant(orderId, userId, databaseClient = { query: runQuery }) {
@@ -95,6 +125,8 @@ async function loadOrderForParticipant(orderId, userId, databaseClient = { query
 
 // ---------- Criar pedido (só cliente) ----------
 
+// Pagamento: pelo app (pix/cartão, cobrado na solicitação) ou com uma sessão
+// de assinatura (subscriptionId). Valor e taxa são sempre do servidor.
 const createOrderSchema = z.object({
   serviceId: z.string().uuid(),
   addressId: z.string().uuid().optional(), // obrigatório só em serviços "at_customer"
@@ -102,8 +134,16 @@ const createOrderSchema = z.object({
   paymentMethod: z.discriminatedUnion("type", [
     z.object({ type: z.literal("pix") }),
     z.object({ type: z.literal("card"), paymentMethodToken: z.string().min(8) }),
-  ]),
-}).strict();
+  ]).optional(),
+  subscriptionId: z.string().uuid().optional(),
+}).strict().refine((body) => Boolean(body.paymentMethod) !== Boolean(body.subscriptionId), {
+  message: "Envie paymentMethod ou subscriptionId (um dos dois).",
+  path: ["paymentMethod"],
+});
+
+// Toda criação de pedido pago pelo app exige a chave (cobrar duas vezes a
+// mesma cliente é o pior bug possível).
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_\-:.]{8,200}$/;
 
 ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request, response) => {
   const orderRequest = createOrderSchema.parse(request.body);
@@ -111,7 +151,27 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
   if (scheduledDate <= new Date())
     throw new ApiError(422, "validation_error", "Invalid.", { scheduledAt: "Must be in the future." });
 
-  const createdOrder = await runInTransaction(async (transactionClient) => {
+  const rawKey = request.get("Idempotency-Key");
+  if (rawKey && !IDEMPOTENCY_KEY_PATTERN.test(rawKey))
+    throw new ApiError(400, "idempotency_key_required", "Idempotency-Key inválida (8 a 200 caracteres).");
+  const idempotencyKey = rawKey ? `${request.user.id}:${rawKey}` : null;
+  const requestFingerprint = fingerprint({ ...orderRequest, paymentMethod: orderRequest.paymentMethod?.type ?? null });
+  // Repetição do mesmo pedido (rede caiu, toque duplo): devolve o pedido já criado
+  if (idempotencyKey) {
+    const { rows: previous } = await runQuery(
+      "SELECT order_id, request_fingerprint FROM charges WHERE idempotency_key=$1",
+      [idempotencyKey]
+    );
+    if (previous[0]) {
+      assertSameRequest(previous[0].request_fingerprint, requestFingerprint);
+      const { rows: existing } = await runQuery(`${ORDER_SELECT_SQL} WHERE orders.id = $2`, [request.user.id, previous[0].order_id]);
+      return response.status(200).json(existing[0]);
+    }
+  }
+
+  let createdOrder;
+  try {
+  createdOrder = await runInTransaction(async (transactionClient) => {
     const { rows: matchingServices } = await transactionClient.query(
       `SELECT service.*, provider_profile.activation_status
        FROM services service
@@ -169,11 +229,33 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
     );
     const insertedOrder = insertedOrders[0];
 
-    // TODO: autorizar/reter o pagamento no gateway (Pix/cartão) antes de gravar como "held"
-    await transactionClient.query(
-      "INSERT INTO payments (order_id,status,method,method_token,held_until) VALUES ($1,'held',$2,$3,$4)",
-      [insertedOrder.id, orderRequest.paymentMethod.type, orderRequest.paymentMethod.paymentMethodToken ?? null, serviceEndDate]
-    );
+    if (orderRequest.subscriptionId) {
+      // Sessão da assinatura: debitada no agendamento (devolvida se cancelar no prazo)
+      await debitEntitlement(transactionClient, {
+        customerId: request.user.id,
+        subscriptionId: orderRequest.subscriptionId,
+        serviceId: service.id,
+        scheduledAt: scheduledDate,
+        orderId: insertedOrder.id,
+      });
+    } else {
+      const account = await payments.receivesInApp(transactionClient, service.provider_id);
+      if (account) {
+        // Cobrado agora, pelo gateway; a prestadora aceita depois do webhook
+        if (!idempotencyKey)
+          throw new ApiError(400, "idempotency_key_required", "Envie o header Idempotency-Key para pagar pelo app.");
+        await payments.createOrderCharge(transactionClient, {
+          order: insertedOrder, service, customerId: request.user.id, paymentMethod: orderRequest.paymentMethod,
+          idempotencyKey, requestFingerprint, account,
+        });
+      } else {
+        // Prestadora sem conta de recebimento: fluxo antigo, sem gateway
+        await transactionClient.query(
+          "INSERT INTO payments (order_id,status,method,method_token,held_until) VALUES ($1,'held',$2,$3,$4)",
+          [insertedOrder.id, orderRequest.paymentMethod.type, orderRequest.paymentMethod.paymentMethodToken ?? null, serviceEndDate]
+        );
+      }
+    }
     await transactionClient.query(
       "INSERT INTO order_events (order_id,actor_id,type) VALUES ($1,$2,'requested')",
       [insertedOrder.id, request.user.id]
@@ -188,6 +270,16 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
     });
     return insertedOrder;
   });
+  } catch (error) {
+    // mesma chave chegando duas vezes ao mesmo tempo: a segunda devolve a primeira
+    if (error.code === "23505" && error.constraint === "charges_idempotency_key_key") {
+      const { rows: previous } = await runQuery("SELECT order_id, request_fingerprint FROM charges WHERE idempotency_key=$1", [idempotencyKey]);
+      assertSameRequest(previous[0].request_fingerprint, requestFingerprint);
+      createdOrder = { id: previous[0].order_id };
+    } else {
+      throw error;
+    }
+  }
 
   const { rows: orderDetails } = await runQuery(`${ORDER_SELECT_SQL} WHERE orders.id = $2`, [request.user.id, createdOrder.id]);
   response.status(201).json(orderDetails[0]);
@@ -347,6 +439,8 @@ async function applyStatusTransition(
   const allowedActor = allowedActorForTransition(order, nextStatus);
   if (!allowedActor || (allowedActor !== "any" && allowedActor !== actingRole))
     throw new ApiError(409, "invalid_transition", `Cannot change from ${order.status} to ${nextStatus}.`);
+  // Pago pelo app: só aceita depois que o webhook confirmar o pagamento
+  if (nextStatus === "accepted") await payments.assertOrderPaid(transactionClient, order);
 
   // Sair de "requested" (aceite ou cancelamento) encerra a sugestão de horário pendente
   await transactionClient.query(
@@ -363,19 +457,26 @@ async function applyStatusTransition(
   if (notifyOther) await notifyOrderStatus(transactionClient, order, nextStatus, actingUserId, reason);
 
   if (nextStatus === "completed") {
-    await transactionClient.query("UPDATE payments SET status='captured' WHERE order_id=$1", [order.id]);
-    await transactionClient.query(
-      "INSERT INTO payouts (order_id,provider_id,amount) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
-      [order.id, order.provider_id, roundToTwoDecimals(Number(order.total_amount))]
-    );
-    await transactionClient.query(
+    // Sessão de assinatura: a receita entrou com a cobrança da assinatura
+    const { rows: usages } = await transactionClient.query("SELECT 1 FROM entitlement_usages WHERE order_id=$1", [order.id]);
+    const charge = await payments.latestOrderCharge(transactionClient, order.id);
+    // Pago pelo app: o repasse já está previsto em payables, com o valor do split
+    const receivableAmount = charge ? decimalFromCents(charge.provider_amount_cents) : roundToTwoDecimals(Number(order.total_amount));
+    if (!charge && !usages[0]) {
+      await transactionClient.query("UPDATE payments SET status='captured' WHERE order_id=$1", [order.id]);
+      await transactionClient.query(
+        "INSERT INTO payouts (order_id,provider_id,amount) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+        [order.id, order.provider_id, roundToTwoDecimals(Number(order.total_amount))]
+      );
+    }
+    if (!usages[0]) await transactionClient.query(
       `INSERT INTO financial_entries
         (provider_id,entry_type,amount,category,description,service_id,customer_id,source_order_id,occurred_at)
        VALUES ($1,'receivable',$2,'Serviço concluído',$3,$4,$5,$6,now())
        ON CONFLICT (source_order_id) WHERE source_order_id IS NOT NULL DO NOTHING`,
       [
         order.provider_id,
-        roundToTwoDecimals(Number(order.total_amount)),
+        receivableAmount,
         `Repasse pendente do atendimento ${order.friendly_id ?? order.id}`,
         order.service_id,
         order.customer_id,
@@ -385,6 +486,8 @@ async function applyStatusTransition(
   }
   if (nextStatus === "cancelled") {
     await transactionClient.query("UPDATE payments SET status='released' WHERE order_id=$1 AND status='held'", [order.id]);
+    // Pago pelo app: estorno (recusa ou cancelamento no prazo) ou sessão devolvida
+    await payments.handleOrderCancelled(transactionClient, order, actingRole);
   }
 }
 

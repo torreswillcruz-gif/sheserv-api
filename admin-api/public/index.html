@@ -38,6 +38,7 @@
         <button type="button" class="section-link" data-section="plans">Planos</button>
         <button type="button" class="section-link" data-section="categories">Categorias</button>
         <button type="button" class="section-link" data-section="services">Serviços</button>
+        <button type="button" class="section-link" data-section="payments">Pagamentos</button>
       </nav>
       <div class="topbar-user">
         <span id="admin-name" class="muted"></span>
@@ -138,6 +139,81 @@
       <p class="list-status muted" role="status"></p>
       <section class="item-list" aria-live="polite"></section>
       <div class="list-footer"><button type="button" class="button ghost load-more" hidden>Carregar mais</button></div>
+    </main>
+
+    <!-- Pagamentos -->
+    <main class="content" data-section-panel="payments" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Pagamentos <span class="badge warning payments-demo-badge" hidden>Modo demonstração</span></h1>
+          <p class="muted">Taxa, camadas, cobrança e repasse. Mudanças valem só para cobranças e assinaturas novas: cada cobrança guarda a configuração usada.</p>
+        </div>
+        <button type="button" class="button ghost refresh-button">Atualizar</button>
+      </div>
+      <p class="list-status muted" role="status"></p>
+      <div class="payments-layout" hidden>
+        <section class="card payments-form-card">
+          <div class="card-head">
+            <div>
+              <h2>Configuração</h2>
+              <p class="muted payments-gateway"></p>
+            </div>
+            <label class="payments-scope-label">
+              Escopo
+              <select class="payments-scope"></select>
+            </label>
+          </div>
+          <p class="muted payments-scope-hint"></p>
+          <form class="payments-form" novalidate></form>
+        </section>
+        <section class="card payments-impact-card">
+          <div class="card-head">
+            <div>
+              <h2>Impacto antes de salvar</h2>
+              <p class="muted payments-reference"></p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="impact-table">
+              <thead>
+                <tr><th>Plano</th><th>Cliente paga</th><th>Prestadora recebe</th><th>Custo do gateway</th><th>Margem</th><th>Avulso</th><th>Diferença</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="muted payments-plans-checked"></p>
+          <ul class="payments-reasons" role="alert"></ul>
+          <label>
+            Motivo da mudança (vai para o log de auditoria)
+            <textarea class="payments-reason" rows="2" maxlength="500"></textarea>
+          </label>
+          <div class="card-actions">
+            <button type="button" class="button primary payments-save" disabled>Salvar configuração</button>
+            <button type="button" class="button ghost payments-discard">Descartar mudanças</button>
+          </div>
+          <details class="card-section payments-reprice">
+            <summary>Aplicar às assinaturas existentes</summary>
+            <p class="muted">Assinatura ativa tem preço contratado. Esta ação grava o preço da configuração atual para valer a partir do próximo ciclo de cada assinatura do escopo e avisa as clientes no app. O ciclo já pago não muda.</p>
+            <label class="checkbox-line"><input type="checkbox" class="reprice-confirm"> Vou comunicar as clientes sobre o novo valor antes do próximo ciclo.</label>
+            <label>
+              Motivo
+              <textarea class="reprice-reason" rows="2" maxlength="500"></textarea>
+            </label>
+            <div class="card-actions">
+              <button type="button" class="button danger-outline reprice-button" disabled>Aplicar às assinaturas existentes</button>
+            </div>
+          </details>
+        </section>
+        <section class="card payments-audit-card">
+          <div class="card-head"><h2>Log de auditoria</h2></div>
+          <div class="table-wrap">
+            <table class="audit-table">
+              <thead><tr><th>Quando</th><th>Quem</th><th>Escopo</th><th>O quê</th><th>Antes</th><th>Depois</th><th>Motivo</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
     </main>
   </div>
 
