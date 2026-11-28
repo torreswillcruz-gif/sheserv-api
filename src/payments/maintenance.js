@@ -11,6 +11,7 @@ const { runMaintenance: runSubscriptionMaintenance } = require("./subscriptions"
 const { resubmitStuckCharges } = require("./charges");
 const { billTierIfDue } = require("./accounts");
 const { brasiliaDateKey } = require("./dates");
+const { generateDueSchedules } = require("./subscriptionSchedule");
 
 async function billDueTiers() {
   const { rows } = await db.runQuery(
@@ -41,6 +42,7 @@ function runPaymentsMaintenance() {
       const steps = [
         ["mock", () => (typeof gateway().pump === "function" ? gateway().pump() : null)],
         ["assinaturas", runSubscriptionMaintenance],
+        ["agendas", generateDueSchedules],
         ["camadas", billDueTiers],
         ["repasses", settleDuePayables],
         ["reenvio", resubmitStuckCharges],

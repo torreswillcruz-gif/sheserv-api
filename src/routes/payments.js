@@ -22,6 +22,7 @@ const plans = require("../payments/plans");
 const subscriptions = require("../payments/subscriptions");
 const views = require("../payments/views");
 const cards = require("../payments/cards");
+const subscriptionSchedule = require("../payments/subscriptionSchedule");
 const { loadProviderSettings } = require("../payments/settings");
 
 const asProvider = requireRole("prestadora");
@@ -280,6 +281,48 @@ paymentsRouter.post("/subscriptions/:id/cancel", asyncHandler(async (request, re
   await subscriptions.cancelSubscription(request.user.id, uuidParam(request.params.id, "Assinatura não encontrada."));
   const list = await read((client) => views.customerSubscriptions(client, request.user.id));
   response.json(list.find((sub) => sub.id === request.params.id));
+}));
+
+// ---------- Agenda da assinatura (cliente) ----------
+
+const timeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Use HH:MM");
+const scheduleRulesSchema = z.array(z.object({
+  serviceId: z.string().uuid(),
+  weekday: z.number().int().min(1).max(7),
+  time: timeSchema,
+}).strict()).max(20);
+
+paymentsRouter.get("/subscriptions/:id/schedule", asCustomer, asyncHandler(async (request, response) => {
+  response.json(await subscriptionSchedule.scheduleView(request.user.id, uuidParam(request.params.id, "Assinatura não encontrada.")));
+}));
+
+// Prévia: as datas que a recorrência marcaria e, nas ocupadas, as opções livres
+paymentsRouter.post("/subscriptions/:id/schedule/preview", asCustomer, asyncHandler(async (request, response) => {
+  const { rules } = z.object({ rules: scheduleRulesSchema }).strict().parse(request.body);
+  response.json(await subscriptionSchedule.previewSchedule(request.user.id, uuidParam(request.params.id, "Assinatura não encontrada."), rules));
+}));
+
+// Salva a recorrência e marca as sessões confirmadas (remarca as futuras)
+paymentsRouter.put("/subscriptions/:id/schedule", asCustomer, asyncHandler(async (request, response) => {
+  const data = z.object({
+    rules: scheduleRulesSchema,
+    sessions: z.array(z.object({ serviceId: z.string().uuid(), startsAt: z.string().datetime({ offset: true }) }).strict()).max(60),
+  }).strict().parse(request.body);
+  const subscriptionId = uuidParam(request.params.id, "Assinatura não encontrada.");
+  const result = await subscriptionSchedule.saveSchedule(request.user.id, subscriptionId, data);
+  response.json({ ...result, schedule: await subscriptionSchedule.scheduleView(request.user.id, subscriptionId) });
+}));
+
+// Uma sessão: resolve uma pendência do mês ou marca uma que sobrou
+paymentsRouter.post("/subscriptions/:id/schedule/sessions", asCustomer, asyncHandler(async (request, response) => {
+  const data = z.object({
+    serviceId: z.string().uuid(),
+    startsAt: z.string().datetime({ offset: true }),
+    pendingId: z.string().uuid().optional(),
+  }).strict().parse(request.body);
+  const subscriptionId = uuidParam(request.params.id, "Assinatura não encontrada.");
+  await subscriptionSchedule.bookOne(request.user.id, subscriptionId, data);
+  response.status(201).json(await subscriptionSchedule.scheduleView(request.user.id, subscriptionId));
 }));
 
 // ---------- Cartões salvos (cliente) ----------

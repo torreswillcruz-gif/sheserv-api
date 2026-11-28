@@ -411,6 +411,92 @@ describe("pagamentos ponta a ponta (PostgreSQL real)", { skip: !DATABASE_URL && 
     assert.deepEqual(cycleTwo.map((row) => [row.status, row.attempt]), [["falhou", 1], ["paga", 2]]);
   });
 
+  test("agenda da assinatura: prévia, conflito com opções, remarcação e mês novo automático", async () => {
+    // dia da semana de amanhã (Brasília) às 10h e às 14h
+    const tomorrow = new Date(Date.now() + 24 * 3600 * 1000);
+    const weekdayName = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", weekday: "short" }).format(tomorrow);
+    const weekday = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 }[weekdayName];
+    const rules10 = [{ serviceId: ids.serviceId, weekday, time: "10:00" }];
+    const base = `/api/v1/subscriptions/${ids.subscriptionId}/schedule`;
+
+    const view = await call("GET", base, { as: ids.customer });
+    assert.equal(view.status, 200, JSON.stringify(view.body));
+    const remaining = view.body.services[0].remaining;
+    assert.ok(remaining >= 1, "há sessões no ciclo");
+
+    const preview = await call("POST", `${base}/preview`, { as: ids.customer, body: { rules: rules10 } });
+    assert.equal(preview.status, 200, JSON.stringify(preview.body));
+    assert.ok(preview.body.sessions.length >= 1);
+    assert.ok(preview.body.sessions.every((session) => session.available));
+
+    // a prestadora já tem um compromisso no primeiro horário: vira opção
+    const first = preview.body.sessions[0];
+    const blocker = await one(
+      `INSERT INTO orders (customer_id,provider_id,service_id,service_location,scheduled_at,duration_minutes,total_amount,commission,checkin_code,status)
+       VALUES ($1,$2,$3,'at_provider',$4,60,20,0,'0000','accepted') RETURNING id`,
+      [ids.customer2.id, ids.provider.id, ids.serviceId, first.wantedAt]
+    );
+    const withConflict = await call("POST", `${base}/preview`, { as: ids.customer, body: { rules: rules10 } });
+    const conflicted = withConflict.body.sessions[0];
+    assert.equal(conflicted.available, false);
+    assert.ok(conflicted.alternatives.length > 0, "oferece horários livres");
+    assert.ok(!conflicted.alternatives.includes(first.wantedAt));
+
+    // confirma: a ocupada vai para a 1ª opção, o resto na recorrência
+    const sessions = withConflict.body.sessions.map((session) => ({
+      serviceId: session.serviceId, startsAt: session.available ? session.wantedAt : session.alternatives[0],
+    }));
+    const saved = await call("PUT", base, { as: ids.customer, body: { rules: rules10, sessions } });
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    assert.equal(saved.body.booked, sessions.length);
+    assert.equal(saved.body.schedule.upcoming.length, sessions.length);
+    assert.ok(saved.body.schedule.upcoming.every((order) => order.status === "accepted"), "já confirmadas");
+    const providerOrders = await call("GET", "/api/v1/provider/me/orders", { as: ids.provider });
+    if (providerOrders.status === 200 && Array.isArray(providerOrders.body)) {
+      assert.ok(providerOrders.body.some((order) => order.id === saved.body.schedule.upcoming[0].orderId));
+    }
+
+    // muda a recorrência: as futuras são remarcadas e as sessões voltam
+    const rules14 = [{ serviceId: ids.serviceId, weekday, time: "14:00" }];
+    const preview14 = await call("POST", `${base}/preview`, { as: ids.customer, body: { rules: rules14 } });
+    assert.equal(preview14.body.sessions.length, sessions.length, "as remarcáveis contam como livres");
+    const moved = await call("PUT", base, {
+      as: ids.customer,
+      body: { rules: rules14, sessions: preview14.body.sessions.map((session) => ({ serviceId: session.serviceId, startsAt: session.wantedAt })) },
+    });
+    assert.equal(moved.status, 200, JSON.stringify(moved.body));
+    assert.equal(moved.body.replaced, sessions.length);
+    assert.ok(moved.body.schedule.upcoming.every((order) => new Date(order.startsAt).toISOString().includes("T17:00")), "14h em Brasília");
+    const entitlement = await one("SELECT sessions_used FROM entitlements WHERE subscription_id=$1 ORDER BY cycle DESC LIMIT 1", [ids.subscriptionId]);
+    assert.ok(entitlement.sessions_used <= view.body.services[0].sessionsPerCycle, "não gasta sessão a mais");
+
+    // mês novo: o agendador marca pela recorrência das 10h; a ocupada vira pendência
+    await call("PUT", base, { as: ids.customer, body: { rules: rules10, sessions: [] } });
+    await db.runQuery("UPDATE subscriptions SET schedule_generated_cycle=NULL WHERE id=$1", [ids.subscriptionId]);
+    await call("POST", "/api/v1/dev/payments/run-maintenance", { as: ids.customer });
+    const generated = await call("GET", base, { as: ids.customer });
+    assert.equal(generated.body.pending.length, 1, JSON.stringify(generated.body));
+    assert.equal(generated.body.upcoming.length, remaining - 1);
+    const notice = await one(
+      "SELECT type FROM notifications WHERE user_id=$1 AND type LIKE 'subscription_schedule%' ORDER BY created_at DESC LIMIT 1",
+      [ids.customer.id]
+    );
+    assert.equal(notice.type, "subscription_schedule_pending");
+
+    // resolve a pendência com uma das opções
+    const pending = generated.body.pending[0];
+    const resolved = await call("POST", `${base}/sessions`, {
+      as: ids.customer, body: { serviceId: pending.serviceId, startsAt: pending.alternatives[0], pendingId: pending.id },
+    });
+    assert.equal(resolved.status, 201, JSON.stringify(resolved.body));
+    assert.equal(resolved.body.pending.length, 0);
+    assert.equal(resolved.body.upcoming.length, remaining);
+
+    // limpa para o resto do roteiro
+    await call("PUT", base, { as: ids.customer, body: { rules: [], sessions: [] } });
+    await db.runQuery("DELETE FROM orders WHERE id=$1", [blocker.id]);
+  });
+
   test("avulso: cobrado na solicitação, idempotente, aceito só depois do webhook; estorno reverte o split", async () => {
     const body = { serviceId: ids.serviceId, scheduledAt: new Date(Date.now() + 4 * 24 * 3600 * 1000).toISOString(), paymentMethod: { type: "pix" } };
     const missingKey = await call("POST", "/api/v1/orders", { as: ids.customer2, body });

@@ -96,3 +96,27 @@ ALTER TABLE payment_webhook_events ADD CONSTRAINT payment_webhook_events_event_t
 ALTER TABLE mock_gateway_objects DROP CONSTRAINT IF EXISTS mock_gateway_objects_kind_check;
 ALTER TABLE mock_gateway_objects ADD CONSTRAINT mock_gateway_objects_kind_check
   CHECK (kind IN ('recipient', 'charge', 'subscription', 'refund', 'card'));
+
+-- ---------- Agenda da assinatura ----------
+-- Recorrência da cliente: [{ serviceId, weekday (1=seg..7=dom), time "HH:MM" }]
+CREATE TABLE IF NOT EXISTS subscription_schedules (
+  subscription_id uuid PRIMARY KEY REFERENCES subscriptions(id) ON DELETE CASCADE,
+  rules jsonb NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS schedule_generated_cycle int;
+-- Pedido criado pela agenda (já confirmado; pode ser remarcado pela recorrência)
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS subscription_schedule boolean NOT NULL DEFAULT false;
+-- Sessão do mês que caiu em horário ocupado: ela escolhe uma das opções
+CREATE TABLE IF NOT EXISTS subscription_schedule_pending (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  subscription_id uuid NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+  cycle int NOT NULL,
+  service_id uuid NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+  wanted_at timestamptz NOT NULL,
+  alternatives jsonb NOT NULL DEFAULT '[]',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_pending_open
+  ON subscription_schedule_pending (subscription_id) WHERE resolved_at IS NULL;
