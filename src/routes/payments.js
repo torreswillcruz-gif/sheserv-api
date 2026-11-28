@@ -21,6 +21,7 @@ const accounts = require("../payments/accounts");
 const plans = require("../payments/plans");
 const subscriptions = require("../payments/subscriptions");
 const views = require("../payments/views");
+const cards = require("../payments/cards");
 const { loadProviderSettings } = require("../payments/settings");
 
 const asProvider = requireRole("prestadora");
@@ -43,12 +44,13 @@ paymentsRouter.get("/me/payments/overview", asProvider, asyncHandler(async (requ
   const providerId = request.user.id;
   const result = await read(async (client) => {
     const settings = await loadProviderSettings(client, providerId);
-    const [account, eligibility, seats, fiscal, tier] = await Promise.all([
+    const [account, eligibility, seats, fiscal, tier, holder] = await Promise.all([
       accounts.loadAccount(client, providerId),
       accounts.providerEligibility(client, providerId),
       accounts.seatUsage(client, providerId, settings),
       views.fiscalProfile(client, providerId),
       accounts.providerTier(client, providerId),
+      accounts.accountHolder(client, providerId),
     ]);
     const { rows: cities } = await client.query(
       "SELECT ibge_code AS \"cityCode\", name, uf FROM municipalities WHERE launched ORDER BY name"
@@ -57,6 +59,8 @@ paymentsRouter.get("/me/payments/overview", asProvider, asyncHandler(async (requ
     return {
       demoMode: isDemoMode(),
       account: accounts.accountView(account),
+      // de quem a conta precisa ser (CPF do cadastro ou CNPJ dos dados fiscais)
+      holder: accounts.holderView(holder),
       eligibility: {
         ...eligibility,
         missing: eligibility.missing.map((key) => ({ key, label: accounts.ELIGIBILITY_LABELS[key] })),
@@ -78,8 +82,10 @@ paymentsRouter.get("/me/payments/overview", asProvider, asyncHandler(async (requ
 }));
 
 const accountSchema = z.object({
-  holderName: z.string().trim().min(3).max(120),
-  holderDocument: z.string().trim().min(11).max(20),
+  // o titular vem do cadastro (PF) ou dos dados fiscais (PJ); só conta antiga
+  // sem CPF no cadastro manda o documento
+  holderName: z.string().trim().min(3).max(120).optional(),
+  holderDocument: z.string().trim().min(11).max(20).optional(),
   bankCode: z.string().regex(/^\d{3}$/, "Código do banco com 3 dígitos."),
   branch: z.string().regex(/^\d{1,5}$/, "Agência só com números."),
   branchDigit: z.string().regex(/^[0-9Xx]$/).nullable().optional(),
@@ -92,6 +98,11 @@ paymentsRouter.put("/me/payments/account", asProvider, asyncHandler(async (reque
   const data = accountSchema.parse(request.body);
   const account = await db.runInTransaction((client) => accounts.saveAccount(client, request.user.id, data));
   response.json(accounts.accountView(account));
+}));
+
+// Prova de vida na instituição de pagamento: gera (ou reaproveita) o link
+paymentsRouter.post("/me/payments/account/kyc-link", asProvider, asyncHandler(async (request, response) => {
+  response.json(await db.runInTransaction((client) => accounts.requestKycLink(client, request.user.id)));
 }));
 
 paymentsRouter.get("/me/payments/fiscal-profile", asProvider, asyncHandler(async (request, response) => {
@@ -230,12 +241,16 @@ paymentsRouter.get("/subscription-plans/:id/checkout", asCustomer, asyncHandler(
 const subscribeSchema = z.object({
   planId: z.string().uuid(),
   // token do cartão gerado no PSP pelo app (no modo demonstração, qualquer
-  // token; 'tok_mock_recusar' simula recusa). Nunca o número do cartão.
-  card: z.object({
-    token: z.string().min(8).max(200),
-    last4: z.string().regex(/^\d{4}$/).optional(),
-    brand: z.string().max(20).optional(),
-  }).strict(),
+  // token; 'tok_mock_recusar' simula recusa) ou um cartão salvo. Nunca o
+  // número do cartão.
+  card: z.union([
+    z.object({
+      token: z.string().min(8).max(200),
+      last4: z.string().regex(/^\d{4}$/).optional(),
+      brand: z.string().max(20).optional(),
+    }).strict(),
+    z.object({ savedCardId: z.string().uuid() }).strict(),
+  ]),
 }).strict();
 
 paymentsRouter.post("/subscriptions", asCustomer, asyncHandler(async (request, response) => {
@@ -254,6 +269,39 @@ paymentsRouter.post("/subscriptions/:id/cancel", asyncHandler(async (request, re
   await subscriptions.cancelSubscription(request.user.id, uuidParam(request.params.id, "Assinatura não encontrada."));
   const list = await read((client) => views.customerSubscriptions(client, request.user.id));
   response.json(list.find((sub) => sub.id === request.params.id));
+}));
+
+// ---------- Cartões salvos (cliente) ----------
+
+const cardSchema = z.object({
+  token: z.string().min(8).max(200),
+  last4: z.string().regex(/^\d{4}$/),
+  brand: z.string().trim().max(20).optional(),
+  expMonth: z.number().int().min(1).max(12),
+  expYear: z.number().int().min(2000).max(2100),
+  holderName: z.string().trim().min(2).max(120),
+  makeDefault: z.boolean().optional(),
+}).strict();
+
+paymentsRouter.get("/me/payments/cards", asCustomer, asyncHandler(async (request, response) => {
+  response.json(await read((client) => cards.listCards(client, request.user.id)));
+}));
+
+paymentsRouter.post("/me/payments/cards", asCustomer, asyncHandler(async (request, response) => {
+  const data = cardSchema.parse(request.body);
+  const now = new Date();
+  if (data.expYear < now.getFullYear() || (data.expYear === now.getFullYear() && data.expMonth < now.getMonth() + 1))
+    throw new ApiError(422, "validation_error", "Cartão vencido.", { expMonth: "Cartão vencido." });
+  response.status(201).json(await cards.addCard(request.user.id, data));
+}));
+
+paymentsRouter.put("/me/payments/cards/:id/default", asCustomer, asyncHandler(async (request, response) => {
+  response.json(await cards.setDefaultCard(request.user.id, uuidParam(request.params.id, "Cartão não encontrado.")));
+}));
+
+paymentsRouter.delete("/me/payments/cards/:id", asCustomer, asyncHandler(async (request, response) => {
+  await cards.deleteCard(request.user.id, uuidParam(request.params.id, "Cartão não encontrado."));
+  response.sendStatus(204);
 }));
 
 module.exports = { paymentsRouter };

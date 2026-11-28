@@ -11,6 +11,7 @@ const { loadProviderSettings, snapshotOf, settingsVersion, payoutSchedule } = re
 const { transition, EVENTS, EFFECTS, ENTITLEMENTS_USABLE } = require("./subscriptionStateMachine");
 const { reserveDeductions, releaseReservedDeductions } = require("./ledger");
 const { loadAccount, providerEligibility, seatUsage, assertCustomerComplete } = require("./accounts");
+const { loadOwnCard, savedCardMethod } = require("./cards");
 
 const periodOptions = (sub) => ({ intervalUnit: sub.interval_unit, intervalCount: sub.interval_count, anchorDay: sub.billing_anchor_day });
 const anchorDayOf = (date) => Number(brasiliaDateKey(date).slice(8, 10));
@@ -27,7 +28,7 @@ function gatewaySplit(split, recipientId) {
 // ---------- Contratar ----------
 
 async function subscribe(customerId, { planId, card }, idempotencyKey) {
-  const requestFingerprint = fingerprint({ customerId, planId, card: card.token });
+  const requestFingerprint = fingerprint({ customerId, planId, card: card.token ?? `saved:${card.savedCardId}` });
   const { rows: existingRows } = await db.runQuery("SELECT * FROM subscriptions WHERE idempotency_key=$1", [idempotencyKey]);
   if (existingRows[0]) {
     assertSameRequest(existingRows[0].request_fingerprint, requestFingerprint);
@@ -39,6 +40,8 @@ async function subscribe(customerId, { planId, card }, idempotencyKey) {
   try {
     subscriptionId = await db.runInTransaction(async (client) => {
       await assertCustomerComplete(client, customerId);
+      // cartão salvo (id nosso) ou token de uso único do PSP
+      const savedCard = card.savedCardId ? await loadOwnCard(client, customerId, card.savedCardId) : null;
       const { rows: plans } = await client.query("SELECT * FROM subscription_plans WHERE id=$1", [planId]);
       const plan = plans[0];
       if (!plan || plan.status !== "ativo") throw new ApiError(404, "plan_unavailable", "Este plano não está disponível.");
@@ -71,13 +74,13 @@ async function subscribe(customerId, { planId, card }, idempotencyKey) {
         `INSERT INTO subscriptions (
            customer_id, provider_id, plan_id, status, provider_amount_cents, fee_cents, total_cents, fee_payer,
            settings_snapshot, settings_version, billing_anchor_day, interval_unit, interval_count,
-           card_last4, card_brand, pending_card_token_encrypted, gateway, idempotency_key, request_fingerprint)
-         VALUES ($1,$2,$3,'pendente',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+           card_last4, card_brand, pending_card_token_encrypted, gateway, idempotency_key, request_fingerprint, saved_card_id)
+         VALUES ($1,$2,$3,'pendente',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
          RETURNING *`,
         [customerId, plan.provider_id, plan.id, breakdown.providerAmountCents, breakdown.feeCents, breakdown.totalCents,
          breakdown.feePayer, snapshotOf(settings), settingsVersion(settings), anchorDayOf(now), plan.interval_unit,
-         plan.interval_count, card.last4 ?? null, card.brand ?? null, encryptText(card.token), gateway().nome,
-         idempotencyKey, requestFingerprint]
+         plan.interval_count, savedCard?.last4 ?? card.last4 ?? null, savedCard?.brand ?? card.brand ?? null,
+         savedCard ? null : encryptText(card.token), gateway().nome, idempotencyKey, requestFingerprint, savedCard?.id ?? null]
       );
       const sub = inserted[0];
       // Descontos de repasse que caem na 1ª cobrança
@@ -105,12 +108,15 @@ async function subscribe(customerId, { planId, card }, idempotencyKey) {
 // Cria a assinatura no gateway (depois do COMMIT; repetível: mesma chave)
 async function submitSubscription(subscriptionId) {
   const { rows } = await db.runQuery(
-    `SELECT s.*, a.gateway_recipient_id FROM subscriptions s
-     JOIN provider_payment_accounts a ON a.provider_id = s.provider_id WHERE s.id=$1`,
+    `SELECT s.*, a.gateway_recipient_id, cc.gateway_card_id, cc.gateway_customer_id FROM subscriptions s
+     JOIN provider_payment_accounts a ON a.provider_id = s.provider_id
+     LEFT JOIN customer_cards cc ON cc.id = s.saved_card_id
+     WHERE s.id=$1`,
     [subscriptionId]
   );
   const sub = rows[0];
-  if (!sub || sub.gateway_subscription_id || sub.status !== "pendente" || !sub.pending_card_token_encrypted) return;
+  if (!sub || sub.gateway_subscription_id || sub.status !== "pendente") return;
+  if (!sub.pending_card_token_encrypted && !sub.gateway_card_id) return;
   const snapshot = sub.settings_snapshot;
   const result = await gateway().createSubscription({
     recipientId: sub.gateway_recipient_id,
@@ -118,7 +124,9 @@ async function submitSubscription(subscriptionId) {
     split: gatewaySplit(sub.current_split, sub.gateway_recipient_id),
     periodicidade: { unidade: sub.interval_unit, quantidade: sub.interval_count },
     inicio: sub.created_at,
-    metodoPagamento: { tipo: "cartao", tokenDoGateway: decryptText(sub.pending_card_token_encrypted) },
+    metodoPagamento: sub.gateway_card_id
+      ? savedCardMethod(sub)
+      : { tipo: "cartao", tokenDoGateway: decryptText(sub.pending_card_token_encrypted) },
     politicaRetentativa: { tentativas: snapshot.retry_max_attempts, intervaloDias: snapshot.retry_interval_days },
     referencia: { tipo: "assinatura", id: sub.id },
     idempotencyKey: `subscription:${sub.id}`,
@@ -414,7 +422,8 @@ async function runMaintenance() {
   // Assinatura que não chegou ao gateway (falha depois do COMMIT)
   const { rows: unsent } = await db.runQuery(
     `SELECT id FROM subscriptions WHERE status='pendente' AND gateway_subscription_id IS NULL
-       AND pending_card_token_encrypted IS NOT NULL AND created_at < now() - interval '1 minute' LIMIT 20`
+       AND (pending_card_token_encrypted IS NOT NULL OR saved_card_id IS NOT NULL)
+       AND created_at < now() - interval '1 minute' LIMIT 20`
   );
   for (const { id } of unsent) await submitSubscription(id).catch((error) => console.error(`assinatura ${id}:`, error.message));
 }

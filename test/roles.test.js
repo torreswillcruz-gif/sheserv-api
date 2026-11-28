@@ -28,14 +28,35 @@ describe("POST /auth/roles", () => {
         id: USER_ID, name: "Ana", email: "ana@example.com", roles: storedRoles,
       }] },
       { pattern: /^UPDATE users SET roles=array_append/, rows: (params) => [{ roles: [...storedRoles, params[1]] }] },
+      // termo de prestadora: ainda não aceito; versão atual = 1
+      { pattern: /FROM term_acceptances a/, rows: () => [] },
+      { pattern: /FROM legal_terms WHERE term_key=\$1 ORDER BY version DESC/, rows: () => [{
+        key: "prestadora_elegibilidade", version: 1, title: "Quem pode", body: "...",
+      }] },
     ]);
   });
 
   const enableRole = (body, user = customerOnly) =>
     server.call("POST", "/api/v1/auth/roles", { ...user, body });
 
+  const acceptedTerms = { key: "prestadora_elegibilidade", version: 1 };
+
+  test("becoming a provider requires accepting the eligibility term", async () => {
+    const response = await enableRole({ role: "prestadora" });
+    assert.equal(response.status, 422);
+    assert.equal(response.body.error.code ?? response.body.code, "terms_required");
+    assert.equal(queriesMatching(/^INSERT INTO term_acceptances/).length, 0);
+  });
+
+  test("an outdated term version is refused", async () => {
+    const response = await enableRole({ role: "prestadora", acceptedTerms: { ...acceptedTerms, version: 0 + 2 } });
+    assert.equal(response.status, 409);
+  });
+
   test("a customer becomes a provider with a pending profile and a fresh session", async () => {
-    const response = await enableRole({ role: "prestadora", providerProfile: { bio: "Manicure" } });
+    const response = await enableRole({ role: "prestadora", providerProfile: { bio: "Manicure" }, acceptedTerms });
+    const acceptance = queriesMatching(/^INSERT INTO term_acceptances/)[0];
+    assert.deepEqual(acceptance.params, [USER_ID, "prestadora_elegibilidade", 1]);
     assert.equal(response.status, 200);
     assert.deepEqual(response.body.user.roles, ["cliente", "prestadora"]);
     const token = jsonWebToken.decode(response.body.accessToken);
@@ -63,7 +84,7 @@ describe("POST /auth/roles", () => {
 
   test("revokes the previous refresh token of the same user", async () => {
     const previousRefreshToken = "previous-refresh-token-value";
-    await enableRole({ role: "prestadora", refreshToken: previousRefreshToken });
+    await enableRole({ role: "prestadora", refreshToken: previousRefreshToken, acceptedTerms });
     const revoke = queriesMatching(/^UPDATE refresh_tokens SET revoked=true WHERE token_hash/)[0];
     const expectedHash = crypto.createHash("sha256").update(previousRefreshToken).digest("hex");
     assert.deepEqual(revoke.params, [expectedHash, USER_ID]);

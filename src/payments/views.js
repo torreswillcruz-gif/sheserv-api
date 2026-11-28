@@ -3,22 +3,13 @@
 // (split e snapshot), nunca recalculado com a configuração atual.
 const { ApiError } = require("../errors");
 const { encryptText, decryptText } = require("../security");
-const { deriveFiscalStatus, FIELD_LABELS, onlyDigits, isValidCpf, isValidCnpj, REGIMES } = require("./fiscal");
+const { deriveFiscalStatus, FIELD_LABELS, onlyDigits, isValidCpf, isValidCnpj, REGIMES, formatDocument } = require("./fiscal");
 const { brasiliaDateKey } = require("./dates");
 
 const safeDecrypt = (value) => {
   if (!value) return null;
   try { return decryptText(value); } catch { return null; }
 };
-
-function formatDocument(document) {
-  if (!document) return null;
-  const digits = onlyDigits(document);
-  if (digits.length === 11) return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}-${digits.slice(9)}`;
-  const value = String(document).toUpperCase();
-  if (value.length === 14) return `${value.slice(0, 2)}.${value.slice(2, 5)}.${value.slice(5, 8)}/${value.slice(8, 12)}-${value.slice(12)}`;
-  return document;
-}
 
 // "126021000" → "1.2602.10.00"
 const formatNbs = (nbs) => (nbs && /^\d{9}$/.test(nbs) ? `${nbs[0]}.${nbs.slice(1, 5)}.${nbs.slice(5, 7)}.${nbs.slice(7)}` : nbs);
@@ -70,6 +61,7 @@ async function providerStatement(client, providerId) {
      FROM payables WHERE provider_id=$1`,
     [providerId]
   );
+  const { rows: kyc } = await client.query("SELECT kyc_status FROM provider_payment_accounts WHERE provider_id=$1", [providerId]);
   return {
     charges: charges.map((charge) => ({
       ...charge,
@@ -79,6 +71,8 @@ async function providerStatement(client, providerId) {
     upcomingPayouts: upcoming,
     openDeductions: deductions,
     totals: totals[0],
+    // sem prova de vida o PSP segura os repasses
+    payoutsOnHold: kyc[0]?.kyc_status !== "aprovada",
   };
 }
 
@@ -152,8 +146,9 @@ async function setInvoiceStatus(client, providerId, chargeId, status) {
 
 async function fiscalProfile(client, providerId) {
   const { rows } = await client.query(
-    `SELECT fp.*, (fp.cpf_encrypted IS NOT NULL) AS "hasCpf", pp.city_code AS provider_city
-     FROM provider_profiles pp LEFT JOIN provider_fiscal_profiles fp ON fp.provider_id = pp.user_id
+    `SELECT fp.*, (fp.cpf_encrypted IS NOT NULL) AS "hasCpf", pp.city_code AS provider_city, u.cpf_encrypted AS user_cpf
+     FROM provider_profiles pp JOIN users u ON u.id = pp.user_id
+     LEFT JOIN provider_fiscal_profiles fp ON fp.provider_id = pp.user_id
      WHERE pp.user_id=$1`,
     [providerId]
   );
@@ -170,7 +165,9 @@ async function fiscalProfile(client, providerId) {
      ORDER BY d.category_id IS NULL LIMIT 1`,
     [cityCode, providerId]
   );
-  const cpf = safeDecrypt(row.cpf_encrypted);
+  // Pessoa física: o CPF é o do cadastro (não se digita de novo)
+  const registeredCpf = safeDecrypt(row.user_cpf);
+  const cpf = registeredCpf ?? safeDecrypt(row.cpf_encrypted);
   const serviceCode = row.service_code ?? defaults[0]?.item_servico ?? null;
   // NBS válidos para o item escolhido (tabela oficial da Receita)
   const { rows: nbsOptions } = await client.query(
@@ -182,6 +179,7 @@ async function fiscalProfile(client, providerId) {
     regime: row.regime ?? null,
     documentType: row.document_type ?? null,
     cpf: cpf ? formatDocument(cpf) : null,
+    cpfFromRegistration: Boolean(registeredCpf),
     cnpj: row.cnpj ? formatDocument(row.cnpj) : null,
     legalName: row.legal_name ?? null,
     municipalRegistration: row.municipal_registration ?? null,
@@ -224,7 +222,14 @@ async function saveFiscalProfile(client, providerId, data) {
     "SELECT cpf_encrypted IS NOT NULL AS has_cpf FROM provider_fiscal_profiles WHERE provider_id=$1",
     [providerId]
   );
-  const hasStoredCpf = Boolean(existing[0]?.has_cpf);
+  const { rows: users } = await client.query("SELECT cpf_encrypted FROM users WHERE id=$1", [providerId]);
+  const registeredCpf = safeDecrypt(users[0]?.cpf_encrypted);
+  if (registeredCpf) {
+    // o CPF do cadastro vale para a nota e para a conta de recebimento
+    if (cpf && cpf !== registeredCpf) errors.cpf = "Use o CPF do seu cadastro. Para trocar, fale com o suporte.";
+    cpf = registeredCpf;
+  }
+  const hasStoredCpf = Boolean(existing[0]?.has_cpf) || Boolean(registeredCpf);
   if (data.regime === "informal" && !cpf && !hasStoredCpf) errors.cpf = "Informal emite com CPF.";
   if (data.regime !== "informal" && data.regime && !cnpj && data.emiteNfse) errors.cnpj = "Informe o CNPJ para emitir nota.";
   if (data.nbsCode && !/^\d{9}$/.test(onlyDigits(data.nbsCode))) errors.nbsCode = "Use o código NBS com 9 dígitos (ex.: 1.2602.10.00).";

@@ -7,7 +7,7 @@ const { gateway, afterCommit } = require("./runtime");
 const { loadProviderSettings, snapshotOf, payoutSchedule } = require("./settings");
 const { installmentCap } = require("./money");
 const { OCCUPIES_SEAT } = require("./subscriptionStateMachine");
-const { isValidCpf, isValidCnpj, isValidCep, onlyDigits, customerMissingFields, loadCustomerFiscalData } = require("./fiscal");
+const { isValidCpf, isValidCnpj, isValidCep, onlyDigits, customerMissingFields, loadCustomerFiscalData, formatDocument } = require("./fiscal");
 
 const TIERS = ["free", "standard", "pro"];
 
@@ -35,17 +35,74 @@ function accountView(account) {
     payoutInterval: account.payout_interval,
     payoutDay: account.payout_day,
     gateway: account.gateway,
+    kyc: {
+      status: account.kyc_status ?? "nao_iniciada",
+      reason: account.kyc_reason ?? null,
+      verifiedAt: account.kyc_verified_at ?? null,
+      linkUrl: account.kyc_link_url ?? null,
+      linkExpiresAt: account.kyc_link_expires_at ?? null,
+    },
   };
+}
+
+const PJ_REGIMES = ["mei", "me", "salao"];
+
+// Titular da conta de recebimento: a conta tem que estar no nome de quem
+// recebe. Pessoa jurídica (MEI, ME, salão) -> CNPJ e razão social dos dados
+// fiscais; pessoa física -> o CPF e o nome do cadastro.
+async function accountHolder(client, providerId) {
+  const { decryptText } = require("../security");
+  const { rows } = await client.query(
+    `SELECT u.name, u.social_name, u.cpf_encrypted AS user_cpf, fp.regime, fp.cnpj, fp.legal_name, fp.cpf_encrypted AS fiscal_cpf
+     FROM users u LEFT JOIN provider_fiscal_profiles fp ON fp.provider_id = u.id WHERE u.id=$1`,
+    [providerId]
+  );
+  const row = rows[0] ?? {};
+  const decrypt = (value) => { try { return value ? decryptText(value) : null; } catch { return null; } };
+  if (PJ_REGIMES.includes(row.regime)) {
+    const cnpj = row.cnpj ? onlyDigits(row.cnpj) : null;
+    return {
+      type: "cnpj",
+      regime: row.regime,
+      name: row.legal_name ?? null,
+      document: cnpj,
+      missing: [!cnpj && "CNPJ", !row.legal_name && "Razão social"].filter(Boolean),
+    };
+  }
+  const cpf = decrypt(row.user_cpf) ?? decrypt(row.fiscal_cpf);
+  return { type: "cpf", regime: row.regime ?? "informal", name: row.name ?? null, document: cpf, missing: cpf ? [] : ["CPF"] };
+}
+
+function holderView(holder) {
+  return { ...holder, document: holder.document ? formatDocument(holder.document) : null };
 }
 
 // Cria (ou refaz, se recusada) o recebedor com os dados bancários. Depois de
 // aprovada, a troca de conta passa pelo suporte: assinaturas ativas têm o
 // split apontando para o recebedor atual.
 async function saveAccount(client, providerId, data) {
-  const document = onlyDigits(data.holderDocument);
-  const documentType = document.length === 11 ? "cpf" : "cnpj";
+  const holder = await accountHolder(client, providerId);
+  if (holder.type === "cnpj" && holder.missing.length)
+    throw new ApiError(422, "holder_incomplete", "Cadastre o CNPJ e a razão social em Dados fiscais antes da conta.", {
+      holderDocument: `Falta: ${holder.missing.join(", ")}.`,
+    });
+  // PF sem CPF no cadastro (contas antigas): aceita o informado e grava no cadastro
+  let document = holder.document;
+  if (!document) {
+    document = onlyDigits(data.holderDocument ?? "");
+    if (!isValidCpf(document)) throw new ApiError(422, "validation_error", "CPF inválido.", { holderDocument: "Informe o seu CPF." });
+    try {
+      await client.query("UPDATE users SET cpf_encrypted=$2, cpf_hash=$3 WHERE id=$1", [providerId, encryptText(document), cpfHash(document)]);
+    } catch (error) {
+      if (error.code === "23505") throw new ApiError(409, "cpf_in_use", "Este CPF já está em outra conta.", { holderDocument: "CPF já cadastrado." });
+      throw error;
+    }
+  }
+  const documentType = holder.type;
   if (documentType === "cpf" ? !isValidCpf(document) : !isValidCnpj(document))
     throw new ApiError(422, "validation_error", "Documento inválido.", { holderDocument: "CPF ou CNPJ inválido." });
+  // o titular é sempre quem recebe: o nome vem do cadastro (PF) ou da razão social (PJ)
+  data = { ...data, holderName: holder.name ?? data.holderName };
 
   const { rows: cities } = await client.query("SELECT 1 FROM municipalities WHERE ibge_code=$1 AND launched", [data.cityCode]);
   if (!cities[0]) throw new ApiError(422, "validation_error", "Cidade fora do lançamento.", { cityCode: "Escolha Guaxupé ou Alfenas." });
@@ -71,7 +128,9 @@ async function saveAccount(client, providerId, data) {
        gateway=EXCLUDED.gateway, holder_name=EXCLUDED.holder_name, holder_document_type=EXCLUDED.holder_document_type,
        holder_document_encrypted=EXCLUDED.holder_document_encrypted, bank_code=EXCLUDED.bank_code, branch=EXCLUDED.branch,
        branch_digit=EXCLUDED.branch_digit, account_type=EXCLUDED.account_type, account_encrypted=EXCLUDED.account_encrypted,
-       account_last4=EXCLUDED.account_last4, status='pendente', status_reason=NULL, gateway_recipient_id=NULL, updated_at=now()`,
+       account_last4=EXCLUDED.account_last4, status='pendente', status_reason=NULL, gateway_recipient_id=NULL,
+       kyc_status=CASE WHEN provider_payment_accounts.kyc_status='aprovada' THEN 'aprovada' ELSE 'nao_iniciada' END,
+       kyc_link_url=NULL, kyc_link_expires_at=NULL, updated_at=now()`,
     values
   );
 
@@ -111,6 +170,40 @@ async function registerRecipient(providerId, dadosPrestadora, dadosBancarios, ca
   }
 }
 
+// ---------- Prova de vida (KYC) no gateway ----------
+// Feita pela instituição de pagamento depois que o recebedor existe. Vira o
+// selo "Identidade verificada" e libera planos e repasses.
+async function requestKycLink(client, providerId) {
+  const account = await loadAccount(client, providerId, { forUpdate: true });
+  if (!account?.gateway_recipient_id || !["em_analise", "aprovada"].includes(account.status))
+    throw new ApiError(409, "account_not_ready", "Cadastre a conta de recebimento antes da prova de vida.");
+  if (account.kyc_status === "aprovada") throw new ApiError(409, "kyc_done", "Sua prova de vida já foi aprovada.");
+  if (account.kyc_link_url && account.kyc_link_expires_at && new Date(account.kyc_link_expires_at) > new Date())
+    return accountView(account);
+  let link;
+  try {
+    link = await gateway().createKycLink(account.gateway_recipient_id);
+  } catch (error) {
+    // o PSP já aprovou (webhook perdido): sincroniza em vez de falhar
+    if (error.code === "kyc_done") {
+      const { rows } = await client.query(
+        `UPDATE provider_payment_accounts SET kyc_status='aprovada', kyc_reason=NULL, kyc_verified_at=COALESCE(kyc_verified_at, now()),
+           kyc_link_url=NULL, kyc_link_expires_at=NULL, updated_at=now()
+         WHERE provider_id=$1 RETURNING *`,
+        [providerId]
+      );
+      return accountView(rows[0]);
+    }
+    throw new ApiError(502, "gateway_error", `A instituição de pagamento não gerou o link: ${error.message}`);
+  }
+  const { rows } = await client.query(
+    `UPDATE provider_payment_accounts SET kyc_status='pendente', kyc_reason=NULL, kyc_link_url=$2, kyc_link_expires_at=$3, updated_at=now()
+     WHERE provider_id=$1 RETURNING *`,
+    [providerId, link.url, link.expiraEm ?? null]
+  );
+  return accountView(rows[0]);
+}
+
 // ---------- Elegibilidade para oferecer planos ----------
 // Assinatura só para quem atende em estabelecimento físico e tem o cadastro
 // completo. Dado fiscal não entra: nunca bloqueia cobrança (regra fiscal 4).
@@ -122,7 +215,8 @@ async function providerEligibility(client, providerId) {
        EXISTS (SELECT 1 FROM provider_venues v WHERE v.provider_id = pp.user_id) AS has_venue,
        EXISTS (SELECT 1 FROM services s WHERE s.provider_id = pp.user_id AND s.active AND NOT s.hidden_by_admin
                  AND s.service_location = 'at_provider' AND s.price_type = 'fixed') AS has_venue_service,
-       (SELECT status FROM provider_payment_accounts a WHERE a.provider_id = pp.user_id) AS account_status
+       (SELECT status FROM provider_payment_accounts a WHERE a.provider_id = pp.user_id) AS account_status,
+       (SELECT kyc_status FROM provider_payment_accounts a WHERE a.provider_id = pp.user_id) AS kyc_status
      FROM provider_profiles pp WHERE pp.user_id = $1`,
     [providerId]
   );
@@ -134,7 +228,8 @@ async function providerEligibility(client, providerId) {
   if (!row.has_venue_service) missing.push("venue_service");
   if (!row.has_city) missing.push("city");
   if (row.account_status !== "aprovada") missing.push("payment_account");
-  return { eligible: missing.length === 0, missing, accountStatus: row.account_status ?? null };
+  if (row.kyc_status !== "aprovada") missing.push("identity");
+  return { eligible: missing.length === 0, missing, accountStatus: row.account_status ?? null, kycStatus: row.kyc_status ?? null };
 }
 
 const ELIGIBILITY_LABELS = {
@@ -144,6 +239,7 @@ const ELIGIBILITY_LABELS = {
   venue_service: "Um serviço de preço fixo atendido no seu espaço",
   city: "Cidade de atuação",
   payment_account: "Conta de recebimento aprovada",
+  identity: "Prova de vida feita pela instituição de pagamento",
 };
 
 // ---------- Camadas e vagas ----------
@@ -323,7 +419,10 @@ module.exports = {
   ELIGIBILITY_LABELS,
   loadAccount,
   accountView,
+  accountHolder,
+  holderView,
   saveAccount,
+  requestKycLink,
   providerEligibility,
   providerTier,
   seatUsage,

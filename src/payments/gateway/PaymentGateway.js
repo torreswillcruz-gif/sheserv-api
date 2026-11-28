@@ -13,13 +13,17 @@
  * @typedef {{ recipientId: string|null, parte: 'prestadora'|'plataforma', valor: number }} SplitItem
  *   recipientId null = conta da plataforma (no Pagar.me, o recebedor padrão da conta).
  * @typedef {{ titular: 'plataforma'|'recebedor', itens: SplitItem[] }} Split
- * @typedef {{ tipo: 'pix' } | { tipo: 'cartao', tokenDoGateway: string }} MetodoPagamento
+ * @typedef {{ tipo: 'pix' } | { tipo: 'cartao', tokenDoGateway: string }
+ *   | { tipo: 'cartao', cartaoId: string, clienteId?: string }} MetodoPagamento
+ *   cartaoId = cartão salvo no PSP (saveCard); tokenDoGateway = token de uso único.
  * @typedef {{ intervalo: 'semanal'|'mensal', dia: number }} CalendarioRepasse
  * @typedef {{ unidade: 'week'|'month', quantidade: number }} Periodicidade
  * @typedef {{ tentativas: number, intervaloDias: number }} PoliticaRetentativa
  * @typedef {{ tipo: 'cobranca'|'assinatura', id: string }} Referencia  nosso id, volta no webhook
  *
- * @typedef {'PAYMENT_CONFIRMED'|'PAYMENT_FAILED'|'PAYMENT_REFUNDED'|'RECIPIENT_APPROVED'|'RECIPIENT_REJECTED'} WebhookEventType
+ * @typedef {'PAYMENT_CONFIRMED'|'PAYMENT_FAILED'|'PAYMENT_REFUNDED'|'RECIPIENT_APPROVED'|'RECIPIENT_REJECTED'
+ *   |'RECIPIENT_KYC_APPROVED'|'RECIPIENT_KYC_REJECTED'} WebhookEventType
+ *   KYC = prova de vida/validação cadastral do recebedor feita pelo PSP.
  * @typedef {{
  *   eventId: string, tipo: WebhookEventType, ocorridoEm: string,
  *   gatewayChargeId?: string, gatewaySubscriptionId?: string, recipientId?: string,
@@ -29,7 +33,10 @@
  * }} WebhookEvent
  */
 
-const WEBHOOK_EVENT_TYPES = ["PAYMENT_CONFIRMED", "PAYMENT_FAILED", "PAYMENT_REFUNDED", "RECIPIENT_APPROVED", "RECIPIENT_REJECTED"];
+const WEBHOOK_EVENT_TYPES = [
+  "PAYMENT_CONFIRMED", "PAYMENT_FAILED", "PAYMENT_REFUNDED",
+  "RECIPIENT_APPROVED", "RECIPIENT_REJECTED", "RECIPIENT_KYC_APPROVED", "RECIPIENT_KYC_REJECTED",
+];
 
 class GatewayError extends Error {
   constructor(code, message, { retryable = false } = {}) {
@@ -83,6 +90,23 @@ class PaymentGateway {
 
   /** @param {CalendarioRepasse} _calendario */
   async updateRecipientPayoutSchedule(_recipientId, _calendario) { throw new NotImplementedGatewayError(this.nome, "updateRecipientPayoutSchedule"); }
+
+  /** Link da prova de vida (KYC) do recebedor, aberto pela prestadora no
+   * celular. O resultado chega por webhook (RECIPIENT_KYC_APPROVED/REJECTED).
+   * No Pagar.me: POST /recipients/{id}/kyc_link.
+   * @returns {Promise<{ url: string, expiraEm: string|null }>} */
+  async createKycLink(_recipientId) { throw new NotImplementedGatewayError(this.nome, "createKycLink"); }
+
+  /** Salva o cartão (a partir do token de uso único) na cliente do PSP.
+   * `exibicao` só é usada se o PSP não devolver bandeira/final/validade.
+   * @param {{ cliente: { nome: string, email: string, documento?: string }, clienteId?: string|null,
+   *   token: string, exibicao?: { final?: string, bandeira?: string, mesValidade?: number, anoValidade?: number, titular?: string } }} _dados
+   * @returns {Promise<{ cartaoId: string, clienteId: string|null, final: string, bandeira: string|null,
+   *   mesValidade: number|null, anoValidade: number|null }>} */
+  async saveCard(_dados) { throw new NotImplementedGatewayError(this.nome, "saveCard"); }
+
+  /** Apaga o cartão salvo no PSP. */
+  async deleteCard(_clienteId, _cartaoId) { throw new NotImplementedGatewayError(this.nome, "deleteCard"); }
 
   /** Assinatura recorrente no cartão. A 1ª cobrança é feita na criação e
    * confirmada por webhook.

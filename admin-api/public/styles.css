@@ -387,3 +387,19 @@ label.check input { width: 18px; height: 18px; accent-color: var(--primary); }
 @media (max-width: 1100px) {
   .payments-layout { grid-template-columns: 1fr; }
 }
+
+/* Conferência dos dados básicos (Serpro) no cartão da prestadora */
+.basic-data-check {
+  border: 1px solid var(--border, #e5d5dc);
+  border-radius: 12px;
+  padding: 12px 16px;
+  display: grid;
+  gap: 10px;
+}
+.basic-data-check legend { padding: 0 6px; font-weight: 700; color: var(--wine); }
+.basic-data-cpf { font-family: ui-monospace, monospace; font-weight: 700; letter-spacing: 0.03em; }
+
+/* Termos */
+.terms-form { display: grid; gap: 14px; }
+.terms-form textarea { font: inherit; line-height: 1.5; }
+.terms-versions { display: grid; gap: 6px; padding-left: 18px; }

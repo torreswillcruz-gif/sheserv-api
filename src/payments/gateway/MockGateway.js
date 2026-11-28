@@ -9,6 +9,10 @@
 // - tokens de teste: 'tok_mock_aprovar' sempre aprova, 'tok_mock_recusar'
 //   sempre recusa;
 // - conta bancária só com zeros: recebedor recusado;
+// - prova de vida (KYC): o link é de mentira; o resultado vem do endpoint de
+//   demonstração (forceKycOutcome) e chega pelo webhook, como no PSP;
+// - cartão salvo guarda o token de teste: salvo com 'tok_mock_recusar', toda
+//   cobrança nele é recusada; 'tok_mock_invalido' não deixa salvar;
 // - dispara os mesmos webhooks que um PSP real, chamando o endpoint da própria
 //   API, assinados com HMAC (header x-mock-signature);
 // - o estado fica no banco (mock_gateway_objects e mock_scheduled_webhooks):
@@ -31,6 +35,8 @@ const RAW_TYPE_TO_EVENT = {
   "charge.refunded": "PAYMENT_REFUNDED",
   "recipient.approved": "RECIPIENT_APPROVED",
   "recipient.refused": "RECIPIENT_REJECTED",
+  "recipient.kyc_approved": "RECIPIENT_KYC_APPROVED",
+  "recipient.kyc_refused": "RECIPIENT_KYC_REJECTED",
 };
 
 const DECLINE_REASONS = [
@@ -122,13 +128,60 @@ class MockGateway extends PaymentGateway {
     await this.#save(recipientId, "recipient", { ...recipient.state, calendario });
   }
 
+  async createKycLink(recipientId) {
+    const recipient = await this.#load(recipientId, "recipient");
+    if (recipient.state.status === "recusada") throw new GatewayError("recipient_refused", "Recebedor recusado: corrija os dados bancários.");
+    if (recipient.state.kyc?.status === "aprovada") throw new GatewayError("kyc_done", "A prova de vida já foi aprovada.");
+    const linkToken = crypto.randomBytes(12).toString("base64url");
+    const expiraEm = new Date(Date.now() + 7 * DAY_MS).toISOString();
+    await this.#save(recipientId, "recipient", { ...recipient.state, kyc: { status: "pendente", linkToken, expiraEm } });
+    return { url: `https://kyc.mock.sheserve.app/${linkToken}`, expiraEm };
+  }
+
+  // ---------- Cartões salvos ----------
+
+  async saveCard({ cliente, clienteId, token, exibicao } = {}) {
+    if (typeof token !== "string" || token.length < 8) throw new GatewayError("invalid_card_token", "Token do cartão inválido.");
+    if (token === "tok_mock_invalido") throw new GatewayError("card_rejected", "O emissor não aceitou este cartão.");
+    if (!cliente?.nome || !cliente?.email) throw new GatewayError("invalid_customer", "Dados da cliente incompletos.");
+    const customerId = clienteId || newId("cus");
+    const cardId = newId("card");
+    const final = /^\d{4}$/.test(exibicao?.final ?? "") ? exibicao.final : token === "tok_mock_recusar" ? "0002" : "4242";
+    const state = {
+      clienteId: customerId,
+      token,
+      final,
+      bandeira: exibicao?.bandeira ?? "visa",
+      mesValidade: exibicao?.mesValidade ?? null,
+      anoValidade: exibicao?.anoValidade ?? null,
+      apagado: false,
+    };
+    await this.#save(cardId, "card", state);
+    return { cartaoId: cardId, clienteId: customerId, final, bandeira: state.bandeira, mesValidade: state.mesValidade, anoValidade: state.anoValidade };
+  }
+
+  async deleteCard(_clienteId, cartaoId) {
+    const card = await this.#load(cartaoId, "card");
+    await this.#save(cartaoId, "card", { ...card.state, apagado: true });
+  }
+
+  // Token que decide a cobrança: o do cartão salvo ou o de uso único
+  async #paymentToken(metodoPagamento) {
+    if (metodoPagamento?.cartaoId) {
+      const card = await this.#load(metodoPagamento.cartaoId, "card");
+      if (card.state.apagado) throw new GatewayError("card_deleted", "Cartão removido.");
+      return card.state.token;
+    }
+    return metodoPagamento?.tokenDoGateway ?? null;
+  }
+
   // ---------- Assinatura ----------
 
   async createSubscription({ recipientId, valorTotal, split, periodicidade, inicio, metodoPagamento, politicaRetentativa, referencia, idempotencyKey }) {
     assertIdempotencyKey(idempotencyKey);
     assertCents(valorTotal, "valorTotal");
     assertSplit(split, valorTotal);
-    if (metodoPagamento?.tipo !== "cartao" || !metodoPagamento.tokenDoGateway)
+    if (metodoPagamento?.tipo !== "cartao" || !(metodoPagamento.tokenDoGateway || metodoPagamento.cartaoId))
       throw new GatewayError("invalid_payment_method", "Assinatura só no cartão.");
     const existing = await this.#findByIdempotencyKey(idempotencyKey);
     if (existing) return { subscriptionId: existing.gateway_id, status: existing.state.status };
@@ -144,7 +197,8 @@ class MockGateway extends PaymentGateway {
       periodicidade,
       inicio: startedAt.toISOString(),
       diaAncora: Number(startedAt.toLocaleString("en-US", { timeZone: "America/Sao_Paulo", day: "numeric" })),
-      token: metodoPagamento.tokenDoGateway,
+      token: await this.#paymentToken(metodoPagamento),
+      cartaoId: metodoPagamento.cartaoId ?? null,
       politica: politicaRetentativa ?? { tentativas: 3, intervaloDias: 2 },
       referencia,
       cicloAtual: 0,
@@ -192,7 +246,7 @@ class MockGateway extends PaymentGateway {
       valorTotal,
       split,
       metodo: metodoPagamento.tipo,
-      token: metodoPagamento.tokenDoGateway ?? null,
+      token: metodoPagamento.tipo === "cartao" ? await this.#paymentToken(metodoPagamento) : null,
       referencia,
       estornado: 0,
       pix: metodoPagamento.tipo === "pix"
@@ -269,6 +323,18 @@ class MockGateway extends PaymentGateway {
       [chargeId]
     );
     await this.pump();
+  }
+
+  // Resultado da prova de vida (no PSP real, a prestadora faz pelo link)
+  async forceKycOutcome(recipientId, outcome) {
+    const recipient = await this.#load(recipientId, "recipient");
+    const approved = outcome === "approve";
+    const motivo = approved ? null : "A selfie não confere com o documento.";
+    await this.#save(recipientId, "recipient", {
+      ...recipient.state,
+      kyc: { ...(recipient.state.kyc ?? {}), status: approved ? "aprovada" : "recusada", motivo },
+    });
+    await this.#emit(approved ? "recipient.kyc_approved" : "recipient.kyc_refused", { recipient_id: recipientId, reason: motivo });
   }
 
   // "Vira o mês": antecipa a próxima cobrança (renovação ou retentativa)

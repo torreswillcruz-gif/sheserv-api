@@ -6,6 +6,8 @@
 //   POST /dev/payments/subscriptions/:id/advance-cycle   "vira o mês": cobra o próximo
 //        ciclo (ou a próxima retentativa) agora; { outcome: 'approve' | 'fail' } opcional
 //   POST /dev/payments/run-maintenance       roda o agendador (fim de ciclo, repasses...)
+//   POST /dev/payments/me/kyc                resultado da prova de vida da prestadora logada
+//        { outcome: 'approve' | 'fail' } (no PSP real ela faz pelo link)
 // Só quem participa da cobrança/assinatura pode usá-los. O resultado chega
 // pelo webhook, como em produção: nada aqui marca cobrança como paga.
 const devPaymentsRouter = require("express").Router();
@@ -98,6 +100,24 @@ devPaymentsRouter.post("/dev/payments/subscriptions/:id/advance-cycle", asyncHan
     "SELECT id, status, current_cycle AS \"cycle\", current_period_end AS \"periodEnd\", retry_attempt AS \"retryAttempt\" FROM subscriptions WHERE id=$1",
     [sub.id]
   );
+  response.json(updated[0]);
+}));
+
+devPaymentsRouter.post("/dev/payments/me/kyc", asyncHandler(async (request, response) => {
+  const { outcome } = z.object({ outcome: z.enum(["approve", "fail"]) }).strict().parse(request.body ?? {});
+  const { rows } = await db.runQuery(
+    "SELECT gateway_recipient_id, kyc_status FROM provider_payment_accounts WHERE provider_id=$1",
+    [request.user.id]
+  );
+  const account = rows[0];
+  if (!account?.gateway_recipient_id) throw new ApiError(409, "account_not_ready", "Cadastre a conta de recebimento antes.");
+  if (account.kyc_status !== "pendente") throw new ApiError(409, "kyc_not_started", "Abra a prova de vida antes de simular o resultado.");
+  try {
+    await gateway().forceKycOutcome(account.gateway_recipient_id, outcome);
+  } catch (error) {
+    throw new ApiError(409, error.code ?? "gateway_error", error.message);
+  }
+  const { rows: updated } = await db.runQuery("SELECT kyc_status AS status FROM provider_payment_accounts WHERE provider_id=$1", [request.user.id]);
   response.json(updated[0]);
 }));
 

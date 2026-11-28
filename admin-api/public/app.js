@@ -8,6 +8,12 @@
   const PAGE_SIZE = 50;
 
   const PROVIDER_STATUS = { pending: "Pendente", active: "Aprovada", rejected: "Recusada" };
+  const KYC_STATUS = {
+    nao_iniciada: "Ainda não fez (faz ao cadastrar a conta de recebimento)",
+    pendente: "Link aberto, aguardando a instituição de pagamento",
+    aprovada: "Verificada pela instituição de pagamento",
+    recusada: "Recusada pela instituição de pagamento",
+  };
   const VERIFICATION_STATUS = { pending: "Pendente", approved: "Aprovada", rejected: "Recusada" };
   const VERIFICATION_TYPES = {
     cpf_selfie: "CPF e selfie",
@@ -297,7 +303,13 @@
     setBadge($(".status-badge", card), PROVIDER_STATUS[provider.activationStatus] ?? provider.activationStatus, provider.activationStatus);
     $(".card-email", card).textContent = provider.email;
     $(".card-phone", card).textContent = formatPhone(provider.phone);
-    $(".card-identity", card).textContent = provider.identityVerified ? "Sim" : "Não";
+    $(".card-social-name", card).textContent = provider.socialName || "—";
+    $(".card-basic-data", card).textContent = provider.basicDataVerified
+      ? `Verificados${provider.basicDataVerifiedAt ? ` em ${formatDate(provider.basicDataVerifiedAt)}` : ""}`
+      : "Ainda não conferidos";
+    $(".card-identity", card).textContent = KYC_STATUS[provider.kycStatus] ?? provider.kycStatus;
+    $(".card-term", card).textContent = provider.termVersion ? `Aceito (versão ${provider.termVersion})` : "Sem aceite registrado";
+    const basicData = wireBasicDataCheck(card, provider);
 
     const bio = $(".card-bio", card);
     bio.textContent = provider.bio?.trim() || "Sem descrição.";
@@ -332,16 +344,57 @@
     wireDecision(card, {
       canApprove: provider.activationStatus !== "active",
       canReject: provider.activationStatus !== "rejected",
-      send: (change) => api("PATCH", `/api/v1/admin/providers/${encodeURIComponent(provider.id)}/approval`,
-        change.approve ? { status: "active" } : { status: "rejected", reason: change.reason }),
+      send: (change) => {
+        if (change.approve) {
+          const check = basicData.value();
+          if (!check) throw new Error("Marque a conferência do CPF e do nome na Serpro antes de aprovar.");
+          return api("PATCH", `/api/v1/admin/providers/${encodeURIComponent(provider.id)}/approval`,
+            { status: "active", basicDataCheck: check });
+        }
+        return api("PATCH", `/api/v1/admin/providers/${encodeURIComponent(provider.id)}/approval`,
+          { status: "rejected", reason: change.reason });
+      },
       onDone: (change) => {
         showToast(change.approve
-          ? `${provider.name} foi aprovada e verificada; já aparece nas buscas.`
+          ? `${provider.name} foi aprovada com os dados básicos verificados; já aparece nas buscas.`
           : `${provider.name} foi recusada. Ela será notificada no app.`);
         onRemoved();
       },
     });
     return card;
+  }
+
+  // Checklist da Serpro: o CPF só aparece quando o admin pede (fica na auditoria)
+  function wireBasicDataCheck(card, provider) {
+    const section = $(".basic-data-check", card);
+    const revealButton = $(".basic-data-reveal", section);
+    const cpfOutput = $(".basic-data-cpf", section);
+    const cpfRegular = $(".check-cpf-regular", section);
+    const nameMatches = $(".check-name-matches", section);
+    const note = $(".check-note", section);
+    if (provider.activationStatus === "active") {
+      section.hidden = true;
+      return { value: () => null };
+    }
+    if (!provider.hasCpf) {
+      revealButton.disabled = true;
+      cpfOutput.textContent = "Sem CPF no cadastro: peça para ela completar antes de aprovar.";
+    }
+    revealButton.addEventListener("click", async () => {
+      revealButton.disabled = true;
+      try {
+        const result = await api("GET", `/api/v1/admin/providers/${encodeURIComponent(provider.id)}/cpf`);
+        cpfOutput.textContent = `${result.cpf} · ${result.name}${result.socialName ? ` (nome social: ${result.socialName})` : ""}`;
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+        revealButton.disabled = false;
+      }
+    });
+    return {
+      value: () => (cpfRegular.checked && nameMatches.checked
+        ? { cpfRegular: true, nameMatches: true, ...(note.value.trim() ? { note: note.value.trim() } : {}) }
+        : null),
+    };
   }
 
   // Recursos da prestadora: o plano decide, e o admin pode liberar (true) ou
@@ -961,6 +1014,63 @@
     return card;
   }
 
+  // ---------- Termos ----------
+
+  function createTermsSection(panel) {
+    const status = $(".list-status", panel);
+    const card = $(".terms-card", panel);
+    const form = $(".terms-form", panel);
+    const title = $(".terms-title", panel);
+    const body = $(".terms-body", panel);
+    const warning = $(".terms-warning", panel);
+    const current = $(".terms-current", panel);
+    const versions = $(".terms-versions", panel);
+    const publishButton = $(".terms-publish", panel);
+    const KEY = "prestadora_elegibilidade";
+
+    const checkPlaceholder = () => { warning.hidden = !/X dias úteis/.test(body.value); };
+    body.addEventListener("input", checkPlaceholder);
+
+    async function load() {
+      status.textContent = "Carregando...";
+      try {
+        const data = await api("GET", `/api/v1/admin/terms/${KEY}`);
+        const latest = data.versions[0];
+        title.value = latest?.title ?? "";
+        body.value = latest?.body ?? "";
+        current.textContent = latest ? `Versão atual: ${latest.version} (${latest.acceptances} aceite(s))` : "Nenhuma versão publicada";
+        versions.replaceChildren(...data.versions.map((version) => {
+          const item = document.createElement("li");
+          item.textContent = `Versão ${version.version} · ${formatDate(version.createdAt)}${version.createdBy ? ` · ${version.createdBy}` : " · padrão do sistema"} · ${version.acceptances} aceite(s)`;
+          return item;
+        }));
+        checkPlaceholder();
+        card.hidden = false;
+        status.textContent = "";
+      } catch (error) {
+        status.textContent = error.message;
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!warning.hidden && !window.confirm("O texto ainda tem \"X dias úteis\". Publicar mesmo assim?")) return;
+      publishButton.disabled = true;
+      try {
+        const created = await api("POST", `/api/v1/admin/terms/${KEY}`, { title: title.value, body: body.value });
+        showToast(`Versão ${created.version} publicada. Os próximos cadastros aceitam esta versão.`);
+        await load();
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+      } finally {
+        publishButton.disabled = false;
+      }
+    });
+
+    $(".refresh-button", panel).addEventListener("click", load);
+    return { load };
+  }
+
   // ---------- Pagamentos ----------
   // Configuração global + override por cidade, impacto antes de salvar,
   // aplicar às assinaturas existentes e log de auditoria. Dinheiro e
@@ -1346,6 +1456,7 @@
     plans: createPlansSection(panels.plans),
     categories: createCategoriesSection(panels.categories),
     payments: createPaymentsSection(panels.payments),
+    terms: createTermsSection(panels.terms),
     services: createListSection({
       panel: panels.services,
       initialFilter: "all",

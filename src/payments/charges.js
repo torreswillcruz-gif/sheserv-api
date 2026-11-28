@@ -13,6 +13,7 @@ const { expectedPayoutDateKey, DAY_MS } = require("./dates");
 const { loadProviderSettings, snapshotOf, settingsVersion, payoutSchedule } = require("./settings");
 const { reserveDeductions, planRefund } = require("./ledger");
 const { loadAccount, assertCustomerComplete } = require("./accounts");
+const { loadOwnCard, savedCardMethod } = require("./cards");
 const { gatewaySplit, returnEntitlement } = require("./subscriptions");
 
 // Prestadora recebe pelo app só com o recebedor aprovado. Sem isso, o pedido
@@ -29,15 +30,16 @@ async function createOrderCharge(client, { order, service, customerId, paymentMe
   const settings = await loadProviderSettings(client, service.provider_id);
   const breakdown = priceBreakdown(centsFromDecimal(service.base_price), settings);
   const method = paymentMethod.type === "pix" ? "pix" : "cartao";
+  const savedCard = paymentMethod.savedCardId ? await loadOwnCard(client, customerId, paymentMethod.savedCardId) : null;
   const { rows } = await client.query(
     `INSERT INTO charges (origin,order_id,customer_id,provider_id,charge_owner,total_cents,fee_cents,provider_amount_cents,
        fee_payer,status,payment_method,idempotency_key,request_fingerprint,gateway,settings_snapshot,settings_version,
-       pending_card_token_encrypted)
-     VALUES ('avulso',$1,$2,$3,$4,$5,$6,$7,$8,'pendente',$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+       pending_card_token_encrypted,saved_card_id)
+     VALUES ('avulso',$1,$2,$3,$4,$5,$6,$7,$8,'pendente',$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
     [order.id, customerId, service.provider_id, gateway().capabilities().titularDaCobranca, breakdown.totalCents,
      breakdown.feeCents, breakdown.providerAmountCents, breakdown.feePayer, method, idempotencyKey, requestFingerprint,
      gateway().nome, snapshotOf(settings), settingsVersion(settings),
-     method === "cartao" ? encryptText(paymentMethod.paymentMethodToken) : null]
+     method === "cartao" && !savedCard ? encryptText(paymentMethod.paymentMethodToken) : null, savedCard?.id ?? null]
   );
   const charge = rows[0];
   const payoutDate = expectedPayoutDateKey(new Date(), method, settings, payoutSchedule(settings, account));
@@ -62,10 +64,12 @@ async function insertSplits(client, chargeId, split, recipientId) {
 // Envia a cobrança ao gateway (depois do COMMIT; repetível com a mesma chave)
 async function submitCharge(chargeId) {
   const { rows } = await db.runQuery(
-    `SELECT c.*, a.gateway_recipient_id,
+    `SELECT c.*, a.gateway_recipient_id, cc.gateway_card_id, cc.gateway_customer_id,
        (SELECT amount_cents FROM charge_splits WHERE charge_id=c.id AND party='prestadora') AS provider_split,
        (SELECT amount_cents FROM charge_splits WHERE charge_id=c.id AND party='plataforma') AS platform_split
-     FROM charges c JOIN provider_payment_accounts a ON a.provider_id = c.provider_id WHERE c.id=$1`,
+     FROM charges c JOIN provider_payment_accounts a ON a.provider_id = c.provider_id
+     LEFT JOIN customer_cards cc ON cc.id = c.saved_card_id
+     WHERE c.id=$1`,
     [chargeId]
   );
   const charge = rows[0];
@@ -76,7 +80,9 @@ async function submitCharge(chargeId) {
     split: gatewaySplit({ prestadora: charge.provider_split, plataforma: charge.platform_split }, charge.gateway_recipient_id),
     metodoPagamento: charge.payment_method === "pix"
       ? { tipo: "pix" }
-      : { tipo: "cartao", tokenDoGateway: decryptText(charge.pending_card_token_encrypted) },
+      : charge.gateway_card_id
+        ? savedCardMethod(charge)
+        : { tipo: "cartao", tokenDoGateway: decryptText(charge.pending_card_token_encrypted) },
     referencia: { tipo: "cobranca", id: charge.id },
     idempotencyKey: `charge:${charge.id}`,
   });

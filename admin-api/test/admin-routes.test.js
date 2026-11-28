@@ -54,16 +54,39 @@ describe("provider approval also verifies", () => {
       adminRule,
       { pattern: /^SELECT provider_user\.id,provider_profile\.activation_status AS status/, rows: [{ id: PROVIDER_ID, status: "pending" }] },
       { pattern: /^UPDATE provider_profiles SET activation_status/, rows: (params) => [{
-        id: PROVIDER_ID, activationStatus: params[0], identityVerified: params[0] === "active",
+        id: PROVIDER_ID, activationStatus: params[0], basicDataVerified: params[0] === "active",
       }] },
     ];
   });
 
-  test("approving marks the provider verified and resolves open verification requests", async () => {
+  test("approving without the Serpro check is refused", async () => {
     const response = await call("PATCH", `/api/v1/admin/providers/${PROVIDER_ID}/approval`, { status: "active" });
+    assert.equal(response.status, 422);
+    assert.equal(queries(/^UPDATE provider_profiles/).length, 0);
+  });
+
+  test("an incomplete Serpro check is refused", async () => {
+    const response = await call("PATCH", `/api/v1/admin/providers/${PROVIDER_ID}/approval`, {
+      status: "active", basicDataCheck: { cpfRegular: true, nameMatches: false },
+    });
+    assert.equal(response.status, 422);
+  });
+
+  test("approving marks the provider verified and resolves open verification requests", async () => {
+    const response = await call("PATCH", `/api/v1/admin/providers/${PROVIDER_ID}/approval`, {
+      status: "active", basicDataCheck: { cpfRegular: true, nameMatches: true, note: "conferido" },
+    });
     assert.equal(response.status, 200);
-    assert.equal(response.body.identityVerified, true);
-    assert.match(queries(/^UPDATE provider_profiles/)[0].sql, /verified=\(\$1='active'\)/);
+    assert.equal(response.body.basicDataVerified, true);
+    const update = queries(/^UPDATE provider_profiles/)[0];
+    assert.match(update.sql, /verified=\(\$1='active'\)/);
+    // o que o admin conferiu fica gravado junto (fonte, quem, observação)
+    const check = JSON.parse(update.params[2]);
+    assert.equal(check.source, "serpro_manual");
+    assert.equal(check.checkedBy, ADMIN_ID);
+    assert.equal(check.note, "conferido");
+    const audit = queries(/^INSERT INTO admin_audit_events/).at(-1);
+    assert.match(audit.params[4], /cpfRegular/);
     const resolved = queries(/^UPDATE verifications SET result/)[0];
     assert.deepEqual(resolved.params.slice(0, 2), [PROVIDER_ID, "approved"]);
     assert.equal(resolved.params[3], ADMIN_ID);
@@ -74,7 +97,7 @@ describe("provider approval also verifies", () => {
       status: "rejected", reason: "Documentos ilegíveis",
     });
     assert.equal(response.status, 200);
-    assert.equal(response.body.identityVerified, false);
+    assert.equal(response.body.basicDataVerified, false);
     const resolved = queries(/^UPDATE verifications SET result/)[0];
     assert.deepEqual(resolved.params.slice(0, 3), [PROVIDER_ID, "rejected", "Documentos ilegíveis"]);
   });

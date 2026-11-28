@@ -25,7 +25,10 @@ async function billDueTiers() {
 async function settleDuePayables() {
   if (gateway().nome !== "mock") return; // no PSP real, o repasse é confirmado por ele
   await db.runQuery(
-    "UPDATE payables SET status='pago', paid_at=now() WHERE status='previsto' AND expected_payout_date <= $1::date",
+    // repasse só para quem fez a prova de vida (o PSP também segura o saldo)
+    `UPDATE payables p SET status='pago', paid_at=now()
+     WHERE p.status='previsto' AND p.expected_payout_date <= $1::date
+       AND EXISTS (SELECT 1 FROM provider_payment_accounts a WHERE a.provider_id=p.provider_id AND a.kyc_status='aprovada')`,
     [brasiliaDateKey(new Date())]
   );
 }

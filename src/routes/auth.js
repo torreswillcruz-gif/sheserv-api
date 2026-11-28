@@ -6,6 +6,13 @@ const { ApiError, asyncHandler } = require("../errors");
 const { createSession, hashWithSha256, requireAuthentication, encryptText } = require("../security");
 const { isValidCpf } = require("../documents");
 const { cpfHash } = require("../payments/accounts");
+const { recordAcceptance, PROVIDER_TERM } = require("./account");
+
+// Aceite do termo de quem pode ser prestadora: a versão que o app mostrou
+const acceptedTermsSchema = z.object({
+  key: z.literal(PROVIDER_TERM),
+  version: z.number().int().positive(),
+}).strict();
 
 // Parâmetros do Argon2id recomendados pela OWASP
 const ARGON2_OPTIONS = { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 };
@@ -19,10 +26,17 @@ const registrationSchema = z.object({
   password: z.string().min(8).max(128),
   role: z.enum(["cliente", "prestadora"]),
   providerProfile: z.object({ bio: z.string().max(500).optional() }).optional(),
-  // CPF da cliente: obrigatório no cadastro (nota fiscal e cobrança pelo app).
-  // Guardado cifrado, com hash para não repetir em outra conta.
+  // nome social (exibido no perfil da prestadora no lugar do nome)
+  socialName: z.string().trim().max(120).optional(),
+  // CPF: obrigatório no cadastro (nota fiscal, cobrança, conta de recebimento
+  // e conferência dos dados básicos). Cifrado, com hash para não repetir.
   cpf: z.string().trim().transform((value) => value.replace(/\D/g, "")).refine(isValidCpf, "CPF inválido.").optional(),
-}).refine((data) => data.role !== "cliente" || Boolean(data.cpf), { message: "Informe o CPF.", path: ["cpf"] });
+  acceptedTerms: acceptedTermsSchema.optional(),
+}).refine((data) => Boolean(data.cpf), { message: "Informe o CPF.", path: ["cpf"] })
+  .refine((data) => data.role !== "prestadora" || Boolean(data.acceptedTerms), {
+    message: "Leia e aceite o termo de quem pode se cadastrar como prestadora.",
+    path: ["acceptedTerms"],
+  });
 
 const loginSchema = z.object({
   email: z.string().trim().toLowerCase().email(),
@@ -38,12 +52,14 @@ authRouter.post("/registrations", asyncHandler(async (request, response) => {
   try {
     const createdUser = await runInTransaction(async (transactionClient) => {
       const { rows: insertedUsers } = await transactionClient.query(
-        `INSERT INTO users (name,email,phone,password_hash,roles,cpf_encrypted,cpf_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,email,roles`,
+        `INSERT INTO users (name,email,phone,password_hash,roles,cpf_encrypted,cpf_hash,social_name)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,email,roles`,
         [registrationData.name, registrationData.email, registrationData.phone, passwordHash, [registrationData.role],
-         registrationData.cpf ? encryptText(registrationData.cpf) : null, registrationData.cpf ? cpfHash(registrationData.cpf) : null]
+         registrationData.cpf ? encryptText(registrationData.cpf) : null, registrationData.cpf ? cpfHash(registrationData.cpf) : null,
+         registrationData.socialName || null]
       );
       if (registrationData.role === "prestadora") {
+        await recordAcceptance(transactionClient, insertedUsers[0].id, PROVIDER_TERM, registrationData.acceptedTerms.version);
         await transactionClient.query(
           "INSERT INTO provider_profiles (user_id,bio) VALUES ($1,$2)",
           [insertedUsers[0].id, registrationData.providerProfile?.bio ?? null]
@@ -120,6 +136,7 @@ const enableRoleSchema = z.object({
   role: z.enum(["cliente", "prestadora"]),
   providerProfile: z.object({ bio: z.string().trim().max(500).optional() }).strict().optional(),
   refreshToken: z.string().min(10).optional(),
+  acceptedTerms: acceptedTermsSchema.optional(),
 }).strict();
 
 authRouter.post("/roles", requireAuthentication, asyncHandler(async (request, response) => {
@@ -141,8 +158,22 @@ authRouter.post("/roles", requireAuthentication, asyncHandler(async (request, re
       );
       roles = updatedRows[0].roles;
     }
-    // A nova prestadora entra como "pending" e passa pela aprovação do admin
+    // A nova prestadora entra como "pending" e passa pela aprovação do admin,
+    // depois de aceitar o termo (quem já aceitou a versão atual não repete)
     if (roleRequest.role === "prestadora") {
+      const { rows: accepted } = await transactionClient.query(
+        `SELECT 1 FROM term_acceptances a
+         WHERE a.user_id=$1 AND a.term_key=$2
+           AND a.version=(SELECT MAX(version) FROM legal_terms WHERE term_key=$2)`,
+        [user.id, PROVIDER_TERM]
+      );
+      if (!accepted[0]) {
+        if (!roleRequest.acceptedTerms)
+          throw new ApiError(422, "terms_required", "Leia e aceite o termo de quem pode se cadastrar como prestadora.", {
+            acceptedTerms: "Obrigatório.",
+          });
+        await recordAcceptance(transactionClient, user.id, PROVIDER_TERM, roleRequest.acceptedTerms.version);
+      }
       await transactionClient.query(
         "INSERT INTO provider_profiles (user_id,bio) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING",
         [user.id, roleRequest.providerProfile?.bio ?? null]

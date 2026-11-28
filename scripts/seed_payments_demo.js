@@ -279,11 +279,24 @@ async function main() {
       const recipientId = mockId("rp");
       await client.query(
         `INSERT INTO provider_payment_accounts (provider_id,gateway,gateway_recipient_id,status,holder_name,holder_document_type,
-           holder_document_encrypted,bank_code,branch,account_type,account_encrypted,account_last4,plans_activated_at,created_at)
-         VALUES ($1,'mock',$2,'aprovada',$3,'cpf',$4,'260','0001','corrente',$5,$6,$7,$7)`,
+           holder_document_encrypted,bank_code,branch,account_type,account_encrypted,account_last4,plans_activated_at,created_at,
+           kyc_status,kyc_verified_at)
+         VALUES ($1,'mock',$2,'aprovada',$3,'cpf',$4,'260','0001','corrente',$5,$6,$7,$7,'aprovada',$7)`,
         [id, recipientId, provider.name, encryptText(cpf), encryptText(`1234${index}5`), `4${index}5`.padStart(4, "0").slice(-4), daysAgo(100)]
       );
-      await saveMock(client, recipientId, "recipient", { status: "aprovada", nome: provider.name, decisao: "aprovada" }, `seed:${recipientId}`);
+      await saveMock(client, recipientId, "recipient", {
+        status: "aprovada", nome: provider.name, decisao: "aprovada", kyc: { status: "aprovada" },
+      }, `seed:${recipientId}`);
+      // termo de elegibilidade aceito e dados básicos conferidos (selo 1)
+      await client.query(
+        `INSERT INTO term_acceptances (user_id,term_key,version)
+         SELECT $1, term_key, MAX(version) FROM legal_terms WHERE term_key='prestadora_elegibilidade' GROUP BY term_key`,
+        [id]
+      );
+      await client.query(
+        "UPDATE provider_profiles SET basic_data_verified_at=$2, basic_data_check=$3 WHERE user_id=$1",
+        [id, daysAgo(100), { source: "serpro_manual", cpfRegular: true, nameMatches: true, note: "seed de demonstração" }]
+      );
       await client.query(
         `INSERT INTO provider_plans (provider_id,plan_name,monthly_approval_limit,tier_changed_at,tier_billed_until)
          VALUES ($1,$2,(SELECT monthly_approval_limit FROM plan_catalog WHERE plan_code=$2),$3,$4)`,
