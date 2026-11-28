@@ -265,6 +265,105 @@ describe("pagamentos ponta a ponta (PostgreSQL real)", { skip: !DATABASE_URL && 
     assert.ok(await one("SELECT 1 FROM invoice_data WHERE charge_id=$1", [charges[0].id]), "dados da nota");
   });
 
+  test("plano: só o valor muda; assinantes são avisadas e pagam o novo a partir do próximo ciclo", async () => {
+    const renamed = await call("PATCH", `/api/v1/me/payments/plans/${ids.planId}`, {
+      as: ids.provider, body: { name: "Outro nome" },
+    });
+    assert.equal(renamed.status, 422, "nome não é editável por enquanto");
+    const pricey = await call("PATCH", `/api/v1/me/payments/plans/${ids.planId}`, {
+      as: ids.provider, body: { priceCents: 9000 },
+    });
+    assert.equal(pricey.status, 422);
+    assert.equal(pricey.body.error.code, "plan_pricier_than_avulso");
+
+    const repriced = await call("PATCH", `/api/v1/me/payments/plans/${ids.planId}`, {
+      as: ids.provider, body: { priceCents: 3200 },
+    });
+    assert.equal(repriced.status, 200, JSON.stringify(repriced.body));
+    assert.equal(repriced.body.priceCents, 3200);
+    assert.equal(repriced.body.notifiedSubscribers, 1);
+    // assinante: preço do ciclo atual igual; o novo fica para o próximo
+    const sub = await one("SELECT total_cents, next_cycle_pricing FROM subscriptions WHERE id=$1", [ids.subscriptionId]);
+    assert.equal(sub.total_cents, 3219);
+    // 3200 + 99 + 4% (128) = 3427
+    assert.equal(sub.next_cycle_pricing.total_cents, 3427);
+    const notice = await one(
+      "SELECT body FROM notifications WHERE user_id=$1 AND type='subscription_repriced' ORDER BY created_at DESC LIMIT 1",
+      [ids.customer.id]
+    );
+    assert.match(notice.body, /de R\$ 32,19 para R\$ 34,27/);
+    assert.match(notice.body, /cancelar antes, sem custo/);
+    // volta ao valor original para o resto do roteiro
+    await call("PATCH", `/api/v1/me/payments/plans/${ids.planId}`, { as: ids.provider, body: { priceCents: 3000 } });
+    await db.runQuery("UPDATE subscriptions SET next_cycle_pricing=NULL, next_cycle_pricing_synced_at=NULL WHERE id=$1", [ids.subscriptionId]);
+
+    const archived = await call("PATCH", `/api/v1/me/payments/plans/${ids.planId}`, {
+      as: ids.provider, body: { status: "arquivado" },
+    });
+    assert.equal(archived.status, 409, "com assinantes não exclui");
+    // serviço com assinante: não exclui (as sessões ainda vão ser usadas)
+    const remove = await call("DELETE", `/api/v1/provider/me/services/${ids.serviceId}`, { as: ids.provider });
+    assert.equal(remove.status, 409);
+    assert.equal(remove.body.error.code, "service_in_plan");
+  });
+
+  test("desativar o serviço pausa os planos dele; quem assina ainda agenda", async () => {
+    const service = await one(
+      `INSERT INTO services (provider_id,category_id,title,base_price,duration_minutes,service_location,price_type,availability)
+       VALUES ($1,'beauty','Hidratação',30.00,60,'at_provider','fixed','[]') RETURNING id`,
+      [ids.provider.id]
+    );
+    const created = await call("POST", "/api/v1/me/payments/plans", {
+      as: ids.provider, body: { name: "Hidratação mensal", priceCents: 2500, items: [{ serviceId: service.id, sessionsPerCycle: 1 }] },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const planId = created.body.plan.id;
+
+    const paused = await call("PATCH", `/api/v1/provider/me/services/${service.id}`, { as: ids.provider, body: { paused: true } });
+    assert.equal(paused.status, 200, JSON.stringify(paused.body));
+    assert.equal(paused.body.paused, true);
+    assert.deepEqual(paused.body.pausedPlans, ["Hidratação mensal"]);
+    const plan = (await call("GET", "/api/v1/me/payments/plans", { as: ids.provider })).body.find((item) => item.id === planId);
+    assert.equal(plan.status, "pausado");
+
+    // continua na lista dela; avulso não agenda
+    const mine = await call("GET", "/api/v1/provider/me/services", { as: ids.provider });
+    assert.equal(mine.body.find((item) => item.id === service.id)?.paused, true);
+    const order = await call("POST", "/api/v1/orders", {
+      as: ids.customer2, headers: { "Idempotency-Key": "e2e-order-paused-service" },
+      body: { serviceId: service.id, scheduledAt: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(), paymentMethod: { type: "pix" } },
+    });
+    assert.notEqual(order.status, 201);
+    // plano não volta enquanto o serviço estiver desativado
+    const reactivate = await call("PATCH", `/api/v1/me/payments/plans/${planId}`, { as: ids.provider, body: { status: "ativo" } });
+    assert.equal(reactivate.status, 422);
+
+    // o serviço do plano com assinante: desativar pausa o plano, e a
+    // assinante ainda agenda com a sessão
+    const mainPaused = await call("PATCH", `/api/v1/provider/me/services/${ids.serviceId}`, { as: ids.provider, body: { paused: true } });
+    assert.equal(mainPaused.status, 200);
+    const subscriberOrder = await call("POST", "/api/v1/orders", {
+      as: ids.customer, headers: { "Idempotency-Key": "e2e-order-paused-with-session" },
+      body: { serviceId: ids.serviceId, scheduledAt: new Date(Date.now() + 8 * 24 * 3600 * 1000).toISOString(), subscriptionId: ids.subscriptionId },
+    });
+    assert.equal(subscriberOrder.status, 201, JSON.stringify(subscriberOrder.body));
+    const cancelled = await call("PATCH", `/api/v1/orders/${subscriberOrder.body.id}/status`, { as: ids.customer, body: { status: "cancelled" } });
+    assert.equal(cancelled.status, 200, "a sessão volta para o resto do roteiro");
+    await call("PATCH", `/api/v1/provider/me/services/${ids.serviceId}`, { as: ids.provider, body: { paused: false } });
+    await call("PATCH", `/api/v1/me/payments/plans/${ids.planId}`, { as: ids.provider, body: { status: "ativo" } });
+
+    // reativar o serviço não reativa o plano sozinho; reativando os dois, ok
+    assert.equal((await call("PATCH", `/api/v1/provider/me/services/${service.id}`, { as: ids.provider, body: { paused: false } })).status, 200);
+    assert.equal((await call("PATCH", `/api/v1/me/payments/plans/${planId}`, { as: ids.provider, body: { status: "ativo" } })).status, 200);
+
+    // excluir o serviço (sem assinantes) também pausa o plano
+    const removed = await call("DELETE", `/api/v1/provider/me/services/${service.id}`, { as: ids.provider });
+    assert.equal(removed.status, 200, JSON.stringify(removed.body));
+    assert.deepEqual(removed.body.pausedPlans, ["Hidratação mensal"]);
+    const archived = await call("PATCH", `/api/v1/me/payments/plans/${planId}`, { as: ids.provider, body: { status: "arquivado" } });
+    assert.equal(archived.status, 204);
+  });
+
   test("limite do Free é sobre assinantes ativas", async () => {
     const response = await call("POST", "/api/v1/subscriptions", {
       as: ids.customer2, headers: { "Idempotency-Key": "e2e-subscribe-0002" },

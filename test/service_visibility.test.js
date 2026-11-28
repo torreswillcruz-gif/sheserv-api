@@ -15,7 +15,8 @@ test("a busca do catálogo ignora serviços ocultos pelo admin", async () => {
   await server.call("GET", "/api/v1/providers?query=manicure&categoryId=beleza&serviceLocation=at_provider");
   const [query] = queriesMatching(/FROM provider_profiles provider_profile/);
   for (const alias of ["listed_service", "matching_service", "category_service", "location_service", "venue_service"]) {
-    assert.match(query.sql, new RegExp(`${alias}\.active AND NOT ${alias}\.hidden_by_admin`), alias);
+    // pausado pela prestadora também fica fora
+    assert.match(query.sql, new RegExp(`${alias}\.active AND NOT ${alias}\.paused AND NOT ${alias}\.hidden_by_admin`), alias);
   }
 });
 
@@ -25,6 +26,8 @@ test("serviço oculto não mostra horários livres", async () => {
   const response = await server.call("GET", `/api/v1/services/${SERVICE_ID}/slots?date=${date}`, customer);
   assert.equal(response.status, 404);
   const [query] = queriesMatching(/FROM services service/);
+  // serviço desativado pela prestadora ainda mostra horários: quem assina
+  // um plano continua agendando as sessões
   assert.match(query.sql, /service\.active AND NOT service\.hidden_by_admin/);
 });
 

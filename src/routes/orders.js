@@ -185,8 +185,10 @@ ordersRouter.post("/orders", requireRole("cliente"), asyncHandler(async (request
       `SELECT service.*, provider_profile.activation_status
        FROM services service
        JOIN provider_profiles provider_profile ON provider_profile.user_id = service.provider_id
-       WHERE service.id = $1 AND service.active AND NOT service.hidden_by_admin`,
-      [orderRequest.serviceId]
+       WHERE service.id = $1 AND service.active AND NOT service.hidden_by_admin
+         -- pausado: fora do avulso; quem assina um plano ainda usa as sessões
+         AND (NOT service.paused OR $2::boolean)`,
+      [orderRequest.serviceId, Boolean(orderRequest.subscriptionId)]
     );
     const service = matchingServices[0];
     if (!service || service.activation_status !== "active")

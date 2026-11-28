@@ -213,7 +213,7 @@ async function providerEligibility(client, providerId) {
        pp.activation_status = 'active' AS approved,
        pp.city_code IS NOT NULL AS has_city,
        EXISTS (SELECT 1 FROM provider_venues v WHERE v.provider_id = pp.user_id) AS has_venue,
-       EXISTS (SELECT 1 FROM services s WHERE s.provider_id = pp.user_id AND s.active AND NOT s.hidden_by_admin
+       EXISTS (SELECT 1 FROM services s WHERE s.provider_id = pp.user_id AND s.active AND NOT s.paused AND NOT s.hidden_by_admin
                  AND s.service_location = 'at_provider' AND s.price_type = 'fixed') AS has_venue_service,
        (SELECT status FROM provider_payment_accounts a WHERE a.provider_id = pp.user_id) AS account_status,
        (SELECT kyc_status FROM provider_payment_accounts a WHERE a.provider_id = pp.user_id) AS kyc_status

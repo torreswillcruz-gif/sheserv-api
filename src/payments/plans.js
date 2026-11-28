@@ -3,9 +3,10 @@
 // cliente vê no checkout.
 const { ApiError } = require("../errors");
 const { centsFromDecimal } = require("./runtime");
-const { planImpact } = require("./money");
+const { planImpact, priceBreakdown } = require("./money");
 const { cycleStart, brasiliaDateKey } = require("./dates");
-const { loadProviderSettings } = require("./settings");
+const { loadProviderSettings, snapshotOf, settingsVersion } = require("./settings");
+const { notify } = require("../notifications");
 const { providerEligibility, seatUsage, chargeActivationIfFirst, ELIGIBILITY_LABELS } = require("./accounts");
 
 // Serviços que podem entrar num plano: da prestadora, ativos, de preço fixo
@@ -13,7 +14,7 @@ const { providerEligibility, seatUsage, chargeActivationIfFirst, ELIGIBILITY_LAB
 async function loadPlanServices(client, providerId, serviceIds) {
   const { rows } = await client.query(
     `SELECT id, title, base_price, duration_minutes FROM services
-     WHERE provider_id=$1 AND id = ANY($2::uuid[]) AND active AND NOT hidden_by_admin
+     WHERE provider_id=$1 AND id = ANY($2::uuid[]) AND active AND NOT paused AND NOT hidden_by_admin
        AND service_location='at_provider' AND price_type='fixed'`,
     [providerId, serviceIds]
   );
@@ -78,11 +79,97 @@ async function createPlan(client, providerId, data) {
 }
 
 async function updatePlanStatus(client, providerId, planId, status) {
-  const { rows } = await client.query(
-    "UPDATE subscription_plans SET status=$3, updated_at=now() WHERE id=$1 AND provider_id=$2 RETURNING id",
-    [planId, providerId, status]
+  return updatePlan(client, providerId, planId, { status });
+}
+
+const OPEN_SUBSCRIPTION_STATUSES = ["pendente", "ativa", "em_retentativa", "suspensa"];
+
+const reais = (cents) => `R$ ${Math.trunc(cents / 100)},${String(cents % 100).padStart(2, "0")}`;
+
+// Mudar o plano: por enquanto só o valor e o status (ativo, pausado =
+// sem novas assinaturas, arquivado = excluído, só sem assinantes).
+// Valor novo: vale já para novas assinantes; quem assina passa a pagar a
+// partir do próximo ciclo (repactuação, como a da taxa no admin) e é avisada,
+// podendo cancelar antes sem custo.
+async function updatePlan(client, providerId, planId, changes) {
+  const { rows: plans } = await client.query(
+    "SELECT * FROM subscription_plans WHERE id=$1 AND provider_id=$2 AND status <> 'arquivado' FOR UPDATE",
+    [planId, providerId]
   );
-  if (!rows[0]) throw new ApiError(404, "not_found", "Plano não encontrado.");
+  const plan = plans[0];
+  if (!plan) throw new ApiError(404, "not_found", "Plano não encontrado.");
+  const { rows: counts } = await client.query(
+    "SELECT COUNT(*)::int AS total FROM subscriptions WHERE plan_id=$1 AND status = ANY($2::text[])",
+    [planId, OPEN_SUBSCRIPTION_STATUSES]
+  );
+  const subscribers = counts[0].total;
+
+  if (changes.status === "arquivado" && subscribers > 0)
+    throw new ApiError(409, "plan_has_subscribers", "Este plano ainda tem assinantes.", {
+      plan: "Pause novas assinaturas: o plano pode ser excluído quando não houver mais assinantes.",
+    });
+
+  const priceChanged = changes.priceCents !== undefined && changes.priceCents !== plan.price_cents;
+  if (priceChanged || (changes.status === "ativo" && plan.status !== "ativo")) {
+    const { rows: items } = await client.query(
+      "SELECT service_id AS \"serviceId\", sessions_per_cycle AS \"sessionsPerCycle\" FROM subscription_plan_items WHERE plan_id=$1",
+      [planId]
+    );
+    // o plano tem que continuar válido (serviços ativos no espaço) e mais
+    // barato que o avulso
+    const quote = await quotePlan(client, providerId, { priceCents: changes.priceCents ?? plan.price_cents, items });
+    if (!quote.cheaperThanAvulso)
+      throw new ApiError(422, "plan_pricier_than_avulso", "O plano ficaria mais caro para a cliente do que o avulso.", {
+        priceCents: `Com este preço a cliente pagaria ${reais(quote.customerPaysCents)} contra ${reais(quote.avulsoCents)} avulso.`,
+      });
+  }
+
+  await client.query(
+    "UPDATE subscription_plans SET price_cents=$2, status=$3, updated_at=now() WHERE id=$1",
+    [planId, changes.priceCents ?? plan.price_cents, changes.status ?? plan.status]
+  );
+  const notified = priceChanged ? await repriceSubscribers(client, providerId, plan, changes.priceCents) : 0;
+  return { planId, subscribers, notified };
+}
+
+async function repriceSubscribers(client, providerId, plan, priceCents) {
+  const settings = await loadProviderSettings(client, providerId);
+  const breakdown = priceBreakdown(priceCents, settings);
+  const { rows: subscriptions } = await client.query(
+    `SELECT id, customer_id, total_cents, current_period_end FROM subscriptions
+     WHERE plan_id=$1 AND status IN ('ativa','em_retentativa') AND NOT cancel_at_period_end FOR UPDATE`,
+    [plan.id]
+  );
+  const { rows: providers } = await client.query(
+    "SELECT COALESCE(NULLIF(social_name,''), name) AS name FROM users WHERE id=$1",
+    [providerId]
+  );
+  const pricing = {
+    provider_amount_cents: breakdown.providerAmountCents,
+    fee_cents: breakdown.feeCents,
+    total_cents: breakdown.totalCents,
+    fee_payer: breakdown.feePayer,
+    settings_snapshot: snapshotOf(settings),
+    settings_version: settingsVersion(settings),
+  };
+  for (const sub of subscriptions) {
+    await client.query(
+      "UPDATE subscriptions SET next_cycle_pricing=$2, next_cycle_pricing_synced_at=NULL, updated_at=now() WHERE id=$1",
+      [sub.id, pricing]
+    );
+    if (breakdown.totalCents === sub.total_cents) continue;
+    const when = sub.current_period_end
+      ? ` a partir da próxima cobrança (${new Date(sub.current_period_end).toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" })})`
+      : " a partir da próxima cobrança";
+    await notify(client, {
+      userId: sub.customer_id,
+      type: "subscription_repriced",
+      title: "O valor da sua assinatura vai mudar",
+      body: `${providers[0]?.name ?? "A prestadora"} mudou o valor do plano "${plan.name}" de ${reais(sub.total_cents)} para ${reais(breakdown.totalCents)} por mês${when}. Você pode cancelar antes, sem custo.`,
+      data: { subscriptionId: sub.id }, area: "customer",
+    });
+  }
+  return subscriptions.length;
 }
 
 // Planos com itens, preços calculados agora (para novas assinantes) e vagas
@@ -197,7 +284,7 @@ async function planSuggestions(client, providerId) {
             ROUND(AVG(v.total::numeric / v.months), 1)::text AS avg_monthly,
             (ARRAY_AGG(u.name ORDER BY v.total DESC))[1:3] AS top_customers
      FROM visits v
-     JOIN services s ON s.id = v.service_id AND s.active AND s.service_location='at_provider' AND s.price_type='fixed'
+     JOIN services s ON s.id = v.service_id AND s.active AND NOT s.paused AND s.service_location='at_provider' AND s.price_type='fixed'
      JOIN users u ON u.id = v.customer_id
      GROUP BY s.id
      ORDER BY returning_customers DESC, AVG(v.total::numeric / v.months) DESC
@@ -223,7 +310,7 @@ async function planSuggestions(client, providerId) {
   // Sem histórico: parte do serviço do espaço, uma vez por semana
   const { rows: services } = await client.query(
     `SELECT id, title, base_price::text AS base_price FROM services
-     WHERE provider_id=$1 AND active AND NOT hidden_by_admin AND service_location='at_provider' AND price_type='fixed'
+     WHERE provider_id=$1 AND active AND NOT paused AND NOT hidden_by_admin AND service_location='at_provider' AND price_type='fixed'
      ORDER BY base_price LIMIT 1`,
     [providerId]
   );
@@ -237,4 +324,4 @@ async function planSuggestions(client, providerId) {
   }));
 }
 
-module.exports = { quotePlan, createPlan, updatePlanStatus, listPlans, publicPlans, checkoutPreview, planSuggestions, customerPlanView };
+module.exports = { quotePlan, createPlan, updatePlan, updatePlanStatus, listPlans, publicPlans, checkoutPreview, planSuggestions, customerPlanView };

@@ -220,7 +220,7 @@ const SERVICE_COLUMNS = `id, category_id AS "categoryId",
   duration_minutes AS "durationMinutes", service_location AS "serviceLocation",
   price_type AS "priceType", accepts_quotes AS "acceptsQuotes",
   briefing_questions AS "briefingQuestions", cancellation_policy AS "cancellationPolicy",
-  availability, active,
+  availability, active, paused,
   hidden_by_admin AS "hiddenByAdmin", hidden_reason AS "hiddenReason"`;
 
 const serviceSchema = z.object({
@@ -240,6 +240,7 @@ const serviceSchema = z.object({
 
 // campo enviado pelo app -> coluna do banco
 const SERVICE_FIELD_TO_COLUMN = {
+  paused: "paused",
   categoryId: "category_id",
   title: "title",
   basePrice: "base_price",
@@ -307,11 +308,53 @@ providerRouter.post("/me/services", asyncHandler(async (request, response) => {
   response.status(201).json(createdServices[0]);
 }));
 
+// Planos que dependem do serviço: ativos (oferecidos agora) ou com
+// assinantes (que têm sessões dele). O serviço não pode deixar de ser "no
+// espaço, preço fixo" enquanto estiver neles.
+async function plansUsingService(serviceId) {
+  const { rows } = await runQuery(
+    `SELECT p.name, p.status,
+       (SELECT COUNT(*)::int FROM subscriptions s
+        WHERE s.plan_id=p.id AND s.status IN ('pendente','ativa','em_retentativa','suspensa')) AS subscribers
+     FROM subscription_plan_items i JOIN subscription_plans p ON p.id=i.plan_id
+     WHERE i.service_id=$1 AND p.status <> 'arquivado'`,
+    [serviceId]
+  );
+  return rows.filter((plan) => plan.status === "ativo" || plan.subscribers > 0);
+}
+
+function assertNotInPlans(plans, action) {
+  if (!plans.length) return;
+  const names = plans.map((plan) => `"${plan.name}"`).join(", ");
+  const withSubscribers = plans.some((plan) => plan.subscribers > 0);
+  throw new ApiError(409, "service_in_plan", `Não é possível ${action} este serviço: ele faz parte do plano ${names}.`, {
+    plans: withSubscribers
+      ? "O plano tem assinantes com sessões deste serviço. Pause novas assinaturas e espere elas terminarem."
+      : "Pause o plano antes.",
+  });
+}
+
+// Desativar o serviço pausa (para novas assinaturas) os planos ativos que o
+// incluem. Quem já assina continua agendando as sessões do serviço.
+async function pausePlansWithService(client, serviceId, providerId) {
+  const { rows } = await client.query(
+    `UPDATE subscription_plans p SET status='pausado', updated_at=now()
+     WHERE p.provider_id=$2 AND p.status='ativo'
+       AND EXISTS (SELECT 1 FROM subscription_plan_items i WHERE i.plan_id=p.id AND i.service_id=$1)
+     RETURNING p.name`,
+    [serviceId, providerId]
+  );
+  return rows.map((row) => row.name);
+}
+
+const servicePatchSchema = serviceSchema.partial().extend({ paused: z.boolean().optional() });
+
 providerRouter.patch("/me/services/:id", asyncHandler(async (request, response) => {
   if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Service not found.");
 
-  const serviceChanges = serviceSchema.partial().parse(request.body);
+  const { paused, ...serviceChanges } = servicePatchSchema.parse(request.body);
   const changedFields = Object.entries(serviceChanges);
+  if (paused !== undefined) changedFields.push(["paused", paused]);
   if (changedFields.length === 0)
     throw new ApiError(422, "validation_error", "The request is invalid.", { body: "No fields to update." });
   if (serviceChanges.categoryId) await assertCategoryExists(serviceChanges.categoryId);
@@ -323,6 +366,11 @@ providerRouter.patch("/me/services/:id", asyncHandler(async (request, response) 
   );
   if (!existingServices[0])
     throw new ApiError(404, "not_found", "Service not found.");
+  // deixar de servir para plano (local/tipo de preço) não pode atingir plano
+  // ativo nem assinante
+  const breaksPlans = (serviceChanges.serviceLocation && serviceChanges.serviceLocation !== "at_provider")
+    || (serviceChanges.priceType && serviceChanges.priceType !== "fixed");
+  if (breaksPlans) assertNotInPlans(await plansUsingService(request.params.id), "mudar assim");
   const resultingPriceType = serviceChanges.priceType ?? existingServices[0].price_type;
   const resultingAcceptsQuotes =
     serviceChanges.acceptsQuotes ?? existingServices[0].accepts_quotes;
@@ -336,24 +384,37 @@ providerRouter.patch("/me/services/:id", asyncHandler(async (request, response) 
   const changedValues = changedFields.map(([fieldName, fieldValue]) =>
     fieldName === "briefingQuestions" || fieldName === "availability" ? JSON.stringify(fieldValue) : fieldValue
   );
-  const { rows: updatedServices } = await runQuery(
-    `UPDATE services SET ${columnAssignments.join(", ")} WHERE id=$1 AND provider_id=$2 AND active RETURNING ${SERVICE_COLUMNS}`,
-    [request.params.id, request.user.id, ...changedValues]
-  );
-  if (!updatedServices[0]) throw new ApiError(404, "not_found", "Service not found.");
-  response.json(updatedServices[0]);
+  const result = await runInTransaction(async (client) => {
+    const { rows: updatedServices } = await client.query(
+      `UPDATE services SET ${columnAssignments.join(", ")} WHERE id=$1 AND provider_id=$2 AND active RETURNING ${SERVICE_COLUMNS}`,
+      [request.params.id, request.user.id, ...changedValues]
+    );
+    if (!updatedServices[0]) throw new ApiError(404, "not_found", "Service not found.");
+    const pausedPlans = paused === true ? await pausePlansWithService(client, request.params.id, request.user.id) : [];
+    return { ...updatedServices[0], pausedPlans };
+  });
+  response.json(result);
 }));
 
 // exclusão lógica: pedidos antigos continuam apontando para o serviço
 providerRouter.delete("/me/services/:id", asyncHandler(async (request, response) => {
   if (!isValidUuid(request.params.id)) throw new ApiError(404, "not_found", "Service not found.");
 
-  const { rowCount: deactivatedCount } = await runQuery(
-    "UPDATE services SET active=false WHERE id=$1 AND provider_id=$2 AND active",
-    [request.params.id, request.user.id]
-  );
-  if (!deactivatedCount) throw new ApiError(404, "not_found", "Service not found.");
-  response.sendStatus(204);
+  // com assinantes, as sessões deste serviço ainda vão ser usadas: só pausar
+  const withSubscribers = (await plansUsingService(request.params.id)).filter((plan) => plan.subscribers > 0);
+  if (withSubscribers.length)
+    throw new ApiError(409, "service_in_plan", `Não é possível excluir: o plano ${withSubscribers.map((plan) => `"${plan.name}"`).join(", ")} tem assinantes com sessões deste serviço.`, {
+      plans: "Desative o serviço (os planos param de aceitar assinaturas) e exclua quando as assinaturas terminarem.",
+    });
+  const pausedPlans = await runInTransaction(async (client) => {
+    const { rowCount: deactivatedCount } = await client.query(
+      "UPDATE services SET active=false WHERE id=$1 AND provider_id=$2 AND active",
+      [request.params.id, request.user.id]
+    );
+    if (!deactivatedCount) throw new ApiError(404, "not_found", "Service not found.");
+    return pausePlansWithService(client, request.params.id, request.user.id);
+  });
+  response.json({ pausedPlans });
 }));
 
 module.exports = providerRouter;

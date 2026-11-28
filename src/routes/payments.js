@@ -172,10 +172,21 @@ paymentsRouter.post("/me/payments/plans", asProvider, asyncHandler(async (reques
   response.status(201).json({ plan: list.find((plan) => plan.id === created.planId), activation: created.activation });
 }));
 
+// Plano: por enquanto só o valor e o status mudam (ativo, pausado = sem
+// novas assinaturas, arquivado = excluído). Valor novo avisa as assinantes e
+// vale para elas a partir do próximo ciclo.
+const updatePlanSchema = z.object({
+  status: z.enum(["ativo", "pausado", "arquivado"]).optional(),
+  priceCents: z.number().int().positive().max(10_000_000).optional(),
+}).strict().refine((data) => Object.keys(data).length > 0, { message: "Nada para mudar.", path: ["body"] });
+
 paymentsRouter.patch("/me/payments/plans/:id", asProvider, asyncHandler(async (request, response) => {
-  const { status } = z.object({ status: z.enum(["ativo", "pausado", "arquivado"]) }).strict().parse(request.body);
-  await db.runInTransaction((client) => plans.updatePlanStatus(client, request.user.id, uuidParam(request.params.id), status));
-  response.sendStatus(204);
+  const changes = updatePlanSchema.parse(request.body);
+  const planId = uuidParam(request.params.id, "Plano não encontrado.");
+  const result = await db.runInTransaction((client) => plans.updatePlan(client, request.user.id, planId, changes));
+  if (changes.status === "arquivado") return response.sendStatus(204);
+  const list = await read((client) => plans.listPlans(client, request.user.id));
+  response.json({ ...list.find((plan) => plan.id === planId), notifiedSubscribers: result.notified });
 }));
 
 paymentsRouter.get("/me/payments/statement", asProvider, asyncHandler(async (request, response) => {

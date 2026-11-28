@@ -687,3 +687,7 @@ CREATE TABLE IF NOT EXISTS provider_feature_overrides (
   overrides jsonb NOT NULL DEFAULT '{}'::jsonb,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Serviço pausado pela prestadora: some da busca e do agendamento, mas
+-- continua na lista dela e pode ser reativado (active=false é a exclusão)
+ALTER TABLE services ADD COLUMN IF NOT EXISTS paused boolean NOT NULL DEFAULT false;
