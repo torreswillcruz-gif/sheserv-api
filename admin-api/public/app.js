@@ -1,4 +1,4 @@
-// Painel administrativo SheServe: prestadoras, verificações, planos, categorias e serviços.
+// Painel administrativo SheServe: prestadoras, verificações, planos, categorias, serviços e pagamentos.
 // Fala só com a própria admin-api (mesma origem). Todo dado vindo da API é
 // inserido com textContent, nunca como HTML.
 (() => {
@@ -961,6 +961,360 @@
     return card;
   }
 
+  // ---------- Pagamentos ----------
+  // Configuração global + override por cidade, impacto antes de salvar,
+  // aplicar às assinaturas existentes e log de auditoria. Dinheiro e
+  // percentual são convertidos de texto para inteiros sem passar por float.
+
+  const PAYMENT_GROUPS = [
+    ["Taxa da SheServe (embutida no preço da cliente)", [
+      ["fee_fixed_cents", "money", "Parte fixa"],
+      ["fee_percent_bps", "percent", "Parte percentual"],
+      ["fee_payer", "enum", "Quem paga a taxa", { cliente: "Cliente (embutida no preço)", prestadora: "Prestadora (sai da parte dela)" }],
+      ["rounding_mode", "enum", "Arredondamento da parte percentual", {
+        half_up: "Meio centavo para cima", half_even: "Meio centavo para o par", floor: "Sempre para baixo", ceil: "Sempre para cima",
+      }],
+    ]],
+    ["Ativação dos planos (descontada dos repasses)", [
+      ["activation_fee_cents", "money", "Taxa de ativação"],
+      ["activation_fee_installments", "int", "Em quantos repasses"],
+    ]],
+    ["Camadas da prestadora", [
+      ["free_max_active_subscribers", "int", "Free: limite de assinantes ativas"],
+      ["standard_price_cents", "money", "Preço do Standard (mês)"],
+      ["pro_price_cents", "money", "Preço do Pro (mês)"],
+    ]],
+    ["Cobrança das assinaturas", [
+      ["retry_max_attempts", "int", "Retentativas depois da falha"],
+      ["retry_interval_days", "int", "Intervalo entre tentativas (dias)"],
+      ["suspension_grace_days", "int", "Suspensa até cancelar (dias)"],
+      ["entitlement_refund_window_hours", "int", "Cancelamento com devolução até (horas antes)"],
+    ]],
+    ["Repasse à prestadora", [
+      ["payout_interval", "enum", "Calendário", { semanal: "Semanal", mensal: "Mensal" }],
+      ["payout_day", "int", "Dia (semanal: 1 = segunda ... 5 = sexta; mensal: 1 a 28)"],
+      ["settlement_days_card", "int", "Liquidação do cartão (dias)"],
+      ["settlement_days_pix", "int", "Liquidação do Pix (dias)"],
+    ]],
+    ["Custo do gateway (para a margem)", [
+      ["gateway_cost_card_fixed_cents", "money", "Cartão: fixo"],
+      ["gateway_cost_card_bps", "percent", "Cartão: percentual"],
+      ["gateway_cost_pix_fixed_cents", "money", "Pix: fixo"],
+      ["gateway_cost_pix_bps", "percent", "Pix: percentual"],
+    ]],
+    ["Gateway de demonstração (mock)", [
+      ["mock_failure_rate_bps", "percent", "Taxa de recusa"],
+      ["mock_latency_ms", "int", "Latência (ms)"],
+    ]],
+  ];
+  const PAYMENT_FIELD_LABELS = Object.fromEntries(PAYMENT_GROUPS.flatMap(([, fields]) => fields.map(([key, , label]) => [key, label])));
+
+  // "1.234,56" / "12,5" / "12" → centavos inteiros
+  function parseMoneyInput(text) {
+    const clean = text.trim().replace(/\s|R\$/g, "");
+    const normalized = clean.includes(",") ? clean.replace(/\./g, "").replace(",", ".") : clean;
+    const match = /^(\d{1,7})(?:\.(\d{1,2}))?$/.exec(normalized);
+    if (!match) return NaN;
+    return Number(match[1]) * 100 + Number((match[2] ?? "").padEnd(2, "0"));
+  }
+  const formatMoneyInput = (cents) => `${Math.trunc(cents / 100)},${String(cents % 100).padStart(2, "0")}`;
+  // "4" / "4,5" / "4,25" → pontos-base inteiros
+  function parsePercentInput(text) {
+    const match = /^(\d{1,3})(?:[.,](\d{1,2}))?$/.exec(text.trim().replace("%", ""));
+    if (!match) return NaN;
+    return Number(match[1]) * 100 + Number((match[2] ?? "").padEnd(2, "0"));
+  }
+  const formatPercentInput = (bps) => `${Math.trunc(bps / 100)},${String(bps % 100).padStart(2, "0")}`;
+  const formatCents = (cents) => (cents == null ? "—" : currencyFormatter.format(cents / 100));
+
+  function formatFieldValue(field, kind, value, options) {
+    if (value == null) return "—";
+    if (kind === "money") return `R$ ${formatMoneyInput(value)}`;
+    if (kind === "percent") return `${formatPercentInput(value)}%`;
+    if (kind === "enum") return options?.[value] ?? value;
+    return String(value);
+  }
+
+  function createPaymentsSection(panel) {
+    const status = $(".list-status", panel);
+    const layout = $(".payments-layout", panel);
+    const refreshButton = $(".refresh-button", panel);
+    const scopeSelect = $(".payments-scope", panel);
+    const scopeHint = $(".payments-scope-hint", panel);
+    const form = $(".payments-form", panel);
+    const impactBody = $(".impact-table tbody", panel);
+    const reasonsList = $(".payments-reasons", panel);
+    const plansChecked = $(".payments-plans-checked", panel);
+    const referenceText = $(".payments-reference", panel);
+    const reasonInput = $(".payments-reason", panel);
+    const saveButton = $(".payments-save", panel);
+    const discardButton = $(".payments-discard", panel);
+    const repriceConfirm = $(".reprice-confirm", panel);
+    const repriceReason = $(".reprice-reason", panel);
+    const repriceButton = $(".reprice-button", panel);
+    const auditBody = $(".audit-table tbody", panel);
+
+    let data = null;
+    let scopeKey = "global";
+    let lastImpact = null;
+    let previewTimer;
+    let previewSequence = 0;
+    const inputs = new Map(); // campo → { element, kind }
+
+    const scopeName = (key) => (key === "global" ? "Global" : data?.cities.find((city) => city.cityCode === key)?.name ?? key);
+    const scopeValues = () => (scopeKey === "global" ? data.global : data.cities.find((city) => city.cityCode === scopeKey)?.override ?? {});
+
+    function buildForm() {
+      form.replaceChildren();
+      inputs.clear();
+      const isGlobal = scopeKey === "global";
+      const values = scopeValues();
+      for (const [title, fields] of PAYMENT_GROUPS) {
+        if (!isGlobal && fields.every(([key]) => data.fields[key]?.globalOnly)) continue;
+        const fieldset = document.createElement("fieldset");
+        const legend = document.createElement("legend");
+        legend.textContent = title;
+        fieldset.append(legend);
+        for (const [key, kind, label, options] of fields) {
+          if (!isGlobal && data.fields[key]?.globalOnly) continue;
+          const wrapper = document.createElement("label");
+          wrapper.className = "payments-field";
+          const caption = document.createElement("span");
+          caption.textContent = label;
+          let element;
+          if (kind === "enum") {
+            element = document.createElement("select");
+            const entries = Object.entries(options);
+            if (!isGlobal) entries.unshift(["", `Herdar (${formatFieldValue(key, kind, data.global[key], options)})`]);
+            fillSelect(element, entries, values[key] ?? "");
+          } else {
+            element = document.createElement("input");
+            element.type = "text";
+            element.inputMode = "decimal";
+            element.autocomplete = "off";
+            const value = values[key];
+            element.value = value == null ? "" : kind === "money" ? formatMoneyInput(value) : kind === "percent" ? formatPercentInput(value) : String(value);
+            if (!isGlobal) element.placeholder = `Herdar (${formatFieldValue(key, kind, data.global[key], options)})`;
+          }
+          element.dataset.field = key;
+          element.addEventListener("input", schedulePreview);
+          element.addEventListener("change", schedulePreview);
+          const error = document.createElement("small");
+          error.className = "form-error field-error";
+          error.hidden = true;
+          wrapper.append(caption, element, error);
+          fieldset.append(wrapper);
+          inputs.set(key, { element, kind, error });
+        }
+        form.append(fieldset);
+      }
+      scopeHint.textContent = isGlobal
+        ? "Vale para todas as cidades, exceto nos campos que uma cidade sobrescreve."
+        : `Só para ${scopeName(scopeKey)}. Campo vazio herda da configuração global (para comparar adesão e evasão entre cidades).`;
+    }
+
+    // Mudanças em relação ao que está salvo no escopo (null = herdar, na cidade)
+    function collectChanges() {
+      const values = scopeValues();
+      const changes = {};
+      const errors = {};
+      for (const [key, { element, kind }] of inputs) {
+        const raw = element.value.trim();
+        let parsed;
+        if (raw === "") parsed = null;
+        else if (kind === "money") parsed = parseMoneyInput(raw);
+        else if (kind === "percent") parsed = parsePercentInput(raw);
+        else if (kind === "int") parsed = /^\d+$/.test(raw) ? Number(raw) : NaN;
+        else parsed = raw;
+        if (Number.isNaN(parsed)) { errors[key] = kind === "money" ? "Use o formato 0,99." : kind === "percent" ? "Use o formato 4,00." : "Número inteiro."; continue; }
+        if (parsed === null && scopeKey === "global") { errors[key] = "Obrigatório na configuração global."; continue; }
+        if ((values[key] ?? null) !== parsed) changes[key] = parsed;
+      }
+      return { changes, errors };
+    }
+
+    function showFieldErrors(errors) {
+      for (const [key, { error }] of inputs) {
+        error.textContent = errors[key] ?? "";
+        error.hidden = !errors[key];
+      }
+    }
+
+    function schedulePreview() {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(preview, 350);
+    }
+
+    function updateSaveState() {
+      const { changes, errors } = collectChanges();
+      const hasChanges = Object.keys(changes).length > 0;
+      saveButton.disabled = !hasChanges || Object.keys(errors).length > 0 || !lastImpact?.canSave || reasonInput.value.trim().length < 3;
+      discardButton.disabled = !hasChanges;
+    }
+
+    async function preview() {
+      const { changes, errors } = collectChanges();
+      showFieldErrors(errors);
+      if (Object.keys(errors).length) {
+        lastImpact = null;
+        renderReasons(["Corrija os campos destacados."]);
+        updateSaveState();
+        return;
+      }
+      const sequence = ++previewSequence;
+      try {
+        const impact = await api("POST", "/api/v1/admin/payments/settings/preview", { scopeKey, changes });
+        if (sequence !== previewSequence) return;
+        lastImpact = impact;
+        renderImpact(impact);
+      } catch (error) {
+        if (sequence !== previewSequence) return;
+        lastImpact = null;
+        renderReasons([error.message]);
+      }
+      updateSaveState();
+    }
+
+    function cell(text, className) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (className) td.className = className;
+      return td;
+    }
+
+    function renderImpact(impact) {
+      impactBody.replaceChildren(...impact.bands.map((band) => {
+        const row = document.createElement("tr");
+        if (band.error) {
+          row.append(cell(formatCents(band.priceCents)), cell(band.error, "negative"));
+          row.lastChild.colSpan = 6;
+          return row;
+        }
+        row.append(
+          cell(formatCents(band.priceCents)),
+          cell(formatCents(band.customerPaysCents)),
+          cell(formatCents(band.providerReceivesCents)),
+          cell(formatCents(band.gatewayCostCents)),
+          cell(formatCents(band.marginCents), band.marginCents < 0 ? "negative" : "positive"),
+          cell(formatCents(band.avulsoCents)),
+          cell(band.savingsCents >= 0 ? `economiza ${formatCents(band.savingsCents)}` : `${formatCents(-band.savingsCents)} mais caro`, band.savingsCents < 0 ? "negative" : "positive"),
+        );
+        return row;
+      }));
+      referenceText.textContent = `Avulso de referência: o mesmo valor em ${impact.referenceSessions} sessões avulsas (mediana dos planos ativos; 4 se não houver), cada uma com a própria taxa. Custo do gateway no cartão (assinatura é só no cartão).`;
+      plansChecked.textContent = impact.plansChecked
+        ? `${impact.plansChecked} plano(s) ativo(s) conferido(s) com os preços avulsos cadastrados pelas prestadoras${impact.affectedScopes?.length > 1 ? ` (escopos: ${impact.affectedScopes.map(scopeName).join(", ")})` : ""}.`
+        : "Nenhum plano ativo neste escopo ainda.";
+      renderReasons(impact.reasons);
+    }
+
+    function renderReasons(reasons) {
+      reasonsList.replaceChildren(...reasons.map((reason) => {
+        const item = document.createElement("li");
+        item.textContent = reason;
+        return item;
+      }));
+      if (!reasons.length && lastImpact) {
+        const item = document.createElement("li");
+        item.className = "ok";
+        item.textContent = "Margem positiva em todas as faixas e nenhum plano mais caro que o avulso.";
+        reasonsList.append(item);
+      }
+    }
+
+    function renderAudit(entries) {
+      auditBody.replaceChildren(...entries.map((entry) => {
+        const row = document.createElement("tr");
+        const field = entry.action === "reprice_existing" ? "Aplicado às assinaturas existentes" : PAYMENT_FIELD_LABELS[entry.field] ?? entry.field;
+        const show = (value) => (value == null ? "—" : typeof value === "object" ? JSON.stringify(value) : String(value));
+        row.append(
+          cell(formatDate(entry.changedAt)),
+          cell(entry.changedBy ?? entry.changedByEmail ?? "—"),
+          cell(scopeName(entry.scopeKey)),
+          cell(field),
+          cell(show(entry.oldValue)),
+          cell(show(entry.newValue)),
+          cell(entry.reason ?? ""),
+        );
+        return row;
+      }));
+    }
+
+    async function load() {
+      status.textContent = "Carregando...";
+      refreshButton.disabled = true;
+      try {
+        const [settings, audit] = await Promise.all([
+          api("GET", "/api/v1/admin/payments/settings"),
+          api("GET", "/api/v1/admin/payments/audit?limit=50"),
+        ]);
+        data = settings;
+        $(".payments-demo-badge", panel).hidden = !settings.demoMode;
+        $(".payments-gateway", panel).textContent = `Gateway ativo: ${settings.gateway}${settings.demoMode ? " (modo demonstração)" : ""}. Definido no servidor pela variável PAYMENT_GATEWAY.`;
+        const previous = scopeKey;
+        fillSelect(scopeSelect, [["global", "Global (padrão)"], ...settings.cities.map((city) => [city.cityCode, `${city.name} (${city.uf})${city.override ? " · com override" : ""}`])], previous);
+        scopeKey = scopeSelect.value || "global";
+        buildForm();
+        renderAudit(audit);
+        layout.hidden = false;
+        status.textContent = "";
+        reasonInput.value = "";
+        await preview();
+      } catch (error) {
+        if (error.status !== 401) status.textContent = `Não foi possível carregar: ${error.message}`;
+      } finally {
+        refreshButton.disabled = false;
+      }
+    }
+
+    scopeSelect.addEventListener("change", () => {
+      scopeKey = scopeSelect.value;
+      buildForm();
+      preview();
+    });
+    reasonInput.addEventListener("input", updateSaveState);
+    discardButton.addEventListener("click", () => { buildForm(); preview(); });
+
+    saveButton.addEventListener("click", async () => {
+      const { changes } = collectChanges();
+      saveButton.disabled = true;
+      try {
+        const result = await api("PUT", `/api/v1/admin/payments/settings/${scopeKey}`, { changes, reason: reasonInput.value.trim() });
+        showToast(result.changed ? `Configuração salva (${result.changed} campo(s)). Vale para cobranças e assinaturas novas.` : "Nada mudou.");
+        await load();
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+        updateSaveState();
+      }
+    });
+
+    const updateRepriceState = () => {
+      repriceButton.disabled = !repriceConfirm.checked || repriceReason.value.trim().length < 3;
+    };
+    repriceConfirm.addEventListener("change", updateRepriceState);
+    repriceReason.addEventListener("input", updateRepriceState);
+    repriceButton.addEventListener("click", async () => {
+      if (!window.confirm(`Aplicar a configuração atual de ${scopeName(scopeKey)} às assinaturas em curso? O novo valor vale a partir do próximo ciclo de cada uma.`)) return;
+      repriceButton.disabled = true;
+      try {
+        const result = await api("POST", "/api/v1/admin/payments/reprice", {
+          scopeKey, confirmCustomerNotice: true, reason: repriceReason.value.trim(),
+        });
+        showToast(`${result.affected} de ${result.checked} assinatura(s) com novo valor a partir do próximo ciclo. As clientes foram avisadas no app.`);
+        repriceConfirm.checked = false;
+        repriceReason.value = "";
+        await load();
+      } catch (error) {
+        if (error.status !== 401) showToast(error.message, true);
+      } finally {
+        updateRepriceState();
+      }
+    });
+
+    refreshButton.addEventListener("click", load);
+    return { load };
+  }
+
   // ---------- Seções ----------
 
   const panels = Object.fromEntries($$("[data-section-panel]").map((panel) => [panel.dataset.sectionPanel, panel]));
@@ -991,6 +1345,7 @@
     }),
     plans: createPlansSection(panels.plans),
     categories: createCategoriesSection(panels.categories),
+    payments: createPaymentsSection(panels.payments),
     services: createListSection({
       panel: panels.services,
       initialFilter: "all",

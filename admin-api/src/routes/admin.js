@@ -2,6 +2,7 @@ const adminRouter = require("express").Router();
 const { z } = require("zod");
 const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
+const { paymentsAdminRouter } = require("./payments");
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PLAN_CODES = ["free", "standard", "pro", "premium"];
@@ -597,5 +598,8 @@ adminRouter.get("/audit-events", asyncHandler(async (request, response) => {
   );
   response.json({ items: rows, limit: filters.limit, offset: filters.offset });
 }));
+
+// Seção Pagamentos (configuração, impacto, auditoria)
+adminRouter.use(paymentsAdminRouter);
 
 module.exports = adminRouter;

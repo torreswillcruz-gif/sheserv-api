@@ -1,6 +1,7 @@
 const catalogRouter = require("express").Router();
 const { z } = require("zod");
 const { runQuery } = require("../db");
+const { applyCustomerPrices } = require("../payments/pricing");
 const { ApiError, asyncHandler } = require("../errors");
 const { isValidUuid } = require("../validation");
 
@@ -200,7 +201,7 @@ catalogRouter.get("/providers", asyncHandler(async (request, response) => {
       searchParams.serviceLocation ?? null,
     ]
   );
-  response.json(providers);
+  response.json(await applyCustomerPrices({ query: runQuery }, providers));
 }));
 
 catalogRouter.get("/providers/:id", asyncHandler(async (request, response) => {
@@ -213,7 +214,7 @@ catalogRouter.get("/providers/:id", asyncHandler(async (request, response) => {
     [null, searchParams.latitude ?? null, searchParams.longitude ?? null, request.params.id]
   );
   if (!matchingProviders[0]) throw new ApiError(404, "not_found", "Provider not found.");
-  response.json(matchingProviders[0]);
+  response.json((await applyCustomerPrices({ query: runQuery }, matchingProviders))[0]);
 }));
 
 module.exports = catalogRouter;

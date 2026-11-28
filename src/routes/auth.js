@@ -3,7 +3,9 @@ const argon2 = require("argon2");
 const { z } = require("zod");
 const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
-const { createSession, hashWithSha256, requireAuthentication } = require("../security");
+const { createSession, hashWithSha256, requireAuthentication, encryptText } = require("../security");
+const { isValidCpf } = require("../documents");
+const { cpfHash } = require("../payments/accounts");
 
 // Parâmetros do Argon2id recomendados pela OWASP
 const ARGON2_OPTIONS = { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 };
@@ -17,7 +19,10 @@ const registrationSchema = z.object({
   password: z.string().min(8).max(128),
   role: z.enum(["cliente", "prestadora"]),
   providerProfile: z.object({ bio: z.string().max(500).optional() }).optional(),
-});
+  // CPF da cliente: obrigatório no cadastro (nota fiscal e cobrança pelo app).
+  // Guardado cifrado, com hash para não repetir em outra conta.
+  cpf: z.string().trim().transform((value) => value.replace(/\D/g, "")).refine(isValidCpf, "CPF inválido.").optional(),
+}).refine((data) => data.role !== "cliente" || Boolean(data.cpf), { message: "Informe o CPF.", path: ["cpf"] });
 
 const loginSchema = z.object({
   email: z.string().trim().toLowerCase().email(),
@@ -33,8 +38,10 @@ authRouter.post("/registrations", asyncHandler(async (request, response) => {
   try {
     const createdUser = await runInTransaction(async (transactionClient) => {
       const { rows: insertedUsers } = await transactionClient.query(
-        "INSERT INTO users (name,email,phone,password_hash,roles) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,roles",
-        [registrationData.name, registrationData.email, registrationData.phone, passwordHash, [registrationData.role]]
+        `INSERT INTO users (name,email,phone,password_hash,roles,cpf_encrypted,cpf_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,email,roles`,
+        [registrationData.name, registrationData.email, registrationData.phone, passwordHash, [registrationData.role],
+         registrationData.cpf ? encryptText(registrationData.cpf) : null, registrationData.cpf ? cpfHash(registrationData.cpf) : null]
       );
       if (registrationData.role === "prestadora") {
         await transactionClient.query(
@@ -46,6 +53,8 @@ authRouter.post("/registrations", asyncHandler(async (request, response) => {
     });
     response.status(201).json(await createSession(createdUser));
   } catch (databaseError) {
+    if (databaseError.code === "23505" && databaseError.constraint === "users_cpf_hash_key")
+      throw new ApiError(409, "cpf_in_use", "Este CPF já está em outra conta.", { cpf: "CPF já cadastrado." });
     if (databaseError.code === "23505") throw new ApiError(409, "conflict", "E-mail or phone already in use.");
     throw databaseError;
   }

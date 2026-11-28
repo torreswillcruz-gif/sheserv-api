@@ -20,8 +20,21 @@ O serviço separado `admin-api/` compartilha o banco e os tokens JWT do
 provisionar o papel administrativo e os endpoints de aprovação, planos e auditoria.
 O cadastro público não pode criar administradores.
 
+## Pagamentos (modo demonstração)
+Módulo completo sobre o `MockGateway` (`PAYMENT_GATEWAY=mock`), no formato do Pagar.me:
+taxa embutida no preço da cliente, split em centavos, assinaturas com retentativa,
+direitos de agendamento, repasse semanal, dados de nota por cobrança e webhooks.
+- Código: `src/payments/` (motor da taxa em `money.js`, máquina de estados em
+  `subscriptionStateMachine.js`); esquema em `src/payments_schema.sql`.
+- Trocar pelo gateway real: [src/payments/README.md](./src/payments/README.md).
+- Seed de demonstração: `npm run seed:demo` (`-- --reset` para recriar). Contas em
+  `@demo.sheserve.app`, senha `demo1234`.
+- Ponta a ponta contra um banco descartável:
+  `PAYMENTS_E2E_DATABASE_URL=postgres://... node --test test/payments_e2e.test.js`.
+- Configuração no painel admin, seção **Pagamentos**.
+
 ## Pendências (marcadas como TODO no código)
-- Gateway de pagamento (Pix/cartão)
+- Gateway de pagamento real (hoje: mock; ver src/payments/README.md)
 - Provedor de OTP (SMS)
 - Provedor de verificação de identidade + upload com URL assinada
 - Notificação de SOS

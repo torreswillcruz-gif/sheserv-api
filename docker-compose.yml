@@ -8,6 +8,7 @@ x-local-secrets: &local-secrets
   JWT_SECRET: local-dev-jwt-secret-change-me-0123456789
   DATABASE_URL: postgres://sheserve:sheserve@db:5432/sheserve
   DATABASE_SSL: "false"
+  PAYMENT_GATEWAY: mock
 
 services:
   db:

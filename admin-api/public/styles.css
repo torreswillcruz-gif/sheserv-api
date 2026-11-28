@@ -335,3 +335,55 @@ label.check input { width: 18px; height: 18px; accent-color: var(--primary); }
 .feature-row select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; background: #fff; font: inherit; }
 .feature-row.overridden .feature-label { font-weight: 600; }
 @media (max-width: 640px) { .feature-row { grid-template-columns: 1fr 1fr; } }
+
+/* Pagamentos */
+.badge.warning { background: var(--warning-bg); color: var(--warning); font-size: 0.75rem; vertical-align: middle; }
+.payments-layout { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+.payments-audit-card { grid-column: 1 / -1; }
+.payments-scope-label { min-width: 220px; }
+.payments-layout select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+}
+.payments-form { display: grid; gap: 14px; margin-top: 12px; }
+.payments-form fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px 14px;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+.payments-form legend { padding: 0 6px; font-weight: 700; color: var(--wine); }
+.payments-field span { font-weight: 600; }
+.payments-field input::placeholder { color: var(--muted); font-weight: 400; }
+.field-error { font-weight: 500; padding: 4px 8px; font-size: 0.8rem; }
+.table-wrap { overflow-x: auto; margin-top: 10px; }
+.impact-table, .audit-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+.impact-table th, .impact-table td, .audit-table th, .audit-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.audit-table td:last-child { white-space: normal; min-width: 180px; }
+.impact-table th, .audit-table th { color: var(--muted); font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.impact-table td.negative { color: var(--error); font-weight: 700; }
+.impact-table td.positive { color: var(--success); font-weight: 600; }
+.payments-reasons { margin: 10px 0; padding-left: 18px; color: var(--error); font-weight: 600; }
+.payments-reasons li.ok { color: var(--success); list-style: "✓  "; }
+.payments-impact-card label { margin-top: 8px; }
+.payments-reprice { margin-top: 16px; }
+.payments-reprice summary { cursor: pointer; font-weight: 700; color: var(--wine); }
+.payments-reprice p { margin: 8px 0; }
+.checkbox-line { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.checkbox-line input { width: 18px; height: 18px; accent-color: var(--primary); }
+@media (max-width: 1100px) {
+  .payments-layout { grid-template-columns: 1fr; }
+}

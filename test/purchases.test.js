@@ -26,28 +26,36 @@ describe("POST /me/purchases", () => {
       { pattern: /^INSERT INTO provider_plans/, rows: (params) => [{
         planCode: params[1], monthlyApprovalLimit: params[2], renewalAt: "2026-12-01T00:00:00.000Z",
       }] },
+      // camadas do módulo de pagamentos
+      { pattern: /^SELECT monthly_approval_limit FROM plan_catalog WHERE plan_code=\$1 AND active/, rows: (params) =>
+        params[0] in activePlans ? [{ monthly_approval_limit: activePlans[params[0]] }] : [] },
+      { pattern: /^SELECT plan_name, tier_billed_until FROM provider_plans/, rows: () => [{ plan_name: "pro", tier_billed_until: null }] },
+      { pattern: /^SELECT plan_name AS "planCode"/, rows: () => [{ planCode: "pro", monthlyApprovalLimit: 100 }] },
+      { pattern: /FROM payment_settings WHERE scope_key = 'global'/, rows: () => [{
+        scope_key: "global", version: 1, pro_price_cents: 5990, standard_price_cents: 2990, fee_fixed_cents: 99,
+      }] },
     ]);
   });
 
-  test("a subscription changes the provider's plan right away (no gateway yet)", async () => {
+  test("Free/Standard/Pro muda a camada na hora e a mensalidade vira desconto nos repasses", async () => {
     const response = await buy({ storeProductId: "subscription-pro", purchaseKind: "subscription", plan: "Pro" });
 
     assert.equal(response.status, 201);
     assert.equal(response.body.status, "active");
     assert.equal(response.body.plan.planCode, "pro");
-    assert.equal(response.body.plan.monthlyApprovalLimit, 100);
-
-    const purchaseUpdate = queriesMatching(/^UPDATE plan_purchases SET status='active',paid_at=now\(\)/)[0];
-    assert.equal(purchaseUpdate.params[0], PURCHASE_ID);
-    // Sem gateway, nenhum dado de transação é inventado.
-    assert.deepEqual(purchaseUpdate.params.slice(1), [null, null, null]);
 
     const planUpsert = queriesMatching(/^INSERT INTO provider_plans/)[0];
-    assert.deepEqual(planUpsert.params, [PROVIDER_ID, "pro", 100]);
-    assert.match(planUpsert.sql, /ON CONFLICT \(provider_id\) DO UPDATE/);
+    assert.deepEqual(planUpsert.params.slice(0, 3), [PROVIDER_ID, "pro", 100]);
+    assert.match(planUpsert.sql, /tier_changed_at/);
+    // Nunca cobrada antes: entra como desconto de repasse com o preço da configuração
+    const deduction = queriesMatching(/^INSERT INTO provider_deductions/)[0];
+    assert.equal(deduction.params[0], PROVIDER_ID);
+    assert.equal(deduction.params[2], 5990);
+    assert.match(deduction.params[4], /^camada:pro:/);
+    assert.equal(queriesMatching(/^UPDATE plan_purchases SET status='active',paid_at=now\(\) WHERE id=\$1/)[0].params[0], PURCHASE_ID);
   });
 
-  test("a plan without a fixed limit keeps the limit empty", async () => {
+  test("Premium (legado) continua pelo caminho antigo", async () => {
     const response = await buy({ storeProductId: "subscription-premium", purchaseKind: "subscription", plan: "premium" });
     assert.equal(response.status, 201);
     assert.deepEqual(queriesMatching(/^INSERT INTO provider_plans/)[0].params, [PROVIDER_ID, "premium", null]);

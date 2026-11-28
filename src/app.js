@@ -17,19 +17,32 @@ const { quotesRouter } = require("./routes/quotes");
 const { erpRouter } = require("./routes/erp");
 const { businessRouter } = require("./routes/business");
 const { notificationsRouter } = require("./routes/notifications");
+const { paymentsRouter } = require("./routes/payments");
+const { devPaymentsRouter } = require("./routes/payments_dev");
+const { receiveWebhook } = require("./payments/webhooks");
+const { asyncHandler } = require("./errors");
 
 const FIFTEEN_MINUTES_IN_MS = 15 * 60 * 1000;
 
 const app = express();
 app.set("trust proxy", 1); // Render fica atrás de proxy
 app.use(helmet());
-app.use(express.json({ limit: "100kb" }));
+// O corpo bruto fica guardado para conferir a assinatura dos webhooks de pagamento
+app.use(express.json({ limit: "100kb", verify: (request, _response, buffer) => { request.rawBody = buffer; } }));
 app.use((request, _response, next) => {
   request.id = crypto.randomUUID(); // usado como traceId nos erros
   next();
 });
 
 app.get("/health", (_request, response) => response.sendStatus(200));
+
+// Webhook do gateway de pagamento: público (fora do login e do limite da
+// API), autenticado pela assinatura do PSP. É a única fonte da verdade do
+// status das cobranças. 500 = o PSP reenvia.
+app.post("/webhooks/payments", asyncHandler(async (request, response) => {
+  await receiveWebhook(request.headers, request.rawBody ? request.rawBody.toString("utf8") : "");
+  response.sendStatus(200);
+}));
 
 const apiV1Router = express.Router();
 
@@ -52,6 +65,9 @@ apiV1Router.use(safetyRoutes);
 apiV1Router.use(socialRoutes);
 apiV1Router.use(quotesRouter);
 apiV1Router.use(notificationsRouter);
+// Pagamentos antes do erpRouter (que exige papel de prestadora para tudo)
+apiV1Router.use(paymentsRouter);
+apiV1Router.use(devPaymentsRouter);
 // Antes do erpRouter: ele exige papel de prestadora para tudo que passa por ele.
 apiV1Router.use(businessRouter);
 apiV1Router.use(erpRouter);

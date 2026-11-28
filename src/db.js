@@ -38,6 +38,9 @@ async function runInTransaction(transactionCallback) {
 async function runMigrations() {
   const schemaSql = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
   await connectionPool.query(schemaSql);
+  // Módulo de pagamentos (depende das tabelas acima)
+  const paymentsSql = fs.readFileSync(path.join(__dirname, "payments_schema.sql"), "utf8");
+  await connectionPool.query(paymentsSql);
 }
 
 module.exports = { connectionPool, runQuery, runInTransaction, runMigrations };

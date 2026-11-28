@@ -17,7 +17,12 @@ providerRouter.get("/me/dashboard", asyncHandler(async (request, response) => {
       [providerId]
     ),
     runQuery("SELECT status, count(*)::int AS total FROM orders WHERE provider_id=$1 GROUP BY status", [providerId]),
-    runQuery("SELECT COALESCE(sum(amount),0)::float AS total FROM payouts WHERE provider_id=$1", [providerId]),
+    // Repasses do fluxo antigo + os do módulo de pagamentos (split gravado, menos estornos)
+    runQuery(
+      `SELECT (COALESCE((SELECT sum(amount) FROM payouts WHERE provider_id=$1),0)
+             + COALESCE((SELECT sum(amount_cents - reversed_cents) FROM payables WHERE provider_id=$1),0) / 100.0)::float AS total`,
+      [providerId]
+    ),
   ]);
 
   response.json({

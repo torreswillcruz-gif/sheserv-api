@@ -32,7 +32,8 @@ async function loadIdentityStatus(userId) {
 // verificação, avisos e push, e terminar o cadastro (endereço; perfil, base e
 // serviços da prestadora, que o admin analisa junto).
 const OPEN_BEFORE_VERIFICATION = [
-  /^\/me\/(identity|verifications|notifications|devices|addresses)(\/|$)/,
+  /^\/me\/(identity|verifications|notifications|devices|addresses|customer-profile)(\/|$)/,
+  /^\/payments\/config$/,
   /^\/provider\/me\/(profile|services|venue)(\/|$)/,
 ];
 
