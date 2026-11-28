@@ -89,11 +89,15 @@ const APPROXIMATE_AREA_RADIUS_METERS = 800;
 const PROVIDER_SELECT_SQL = `
   SELECT
     provider_user.id,
-    provider_user.name,
+    COALESCE(NULLIF(provider_user.social_name, ''), provider_user.name) AS name,
     provider_profile.bio,
     provider_brand.brand_name AS "brandName",
     provider_brand.tagline AS "brandTagline",
     provider_profile.verified,
+    -- selos: dados básicos conferidos pelo admin e prova de vida no gateway
+    provider_profile.verified AS "basicDataVerified",
+    EXISTS (SELECT 1 FROM provider_payment_accounts kyc_account
+            WHERE kyc_account.provider_id = provider_user.id AND kyc_account.kyc_status = 'aprovada') AS "identityVerified",
     provider_profile.activation_status AS "activationStatus",
     COALESCE(ratings.average_rating, 0)::float AS rating,
     COALESCE(ratings.review_count, 0)::int AS "reviewCount",
@@ -167,6 +171,7 @@ catalogRouter.get("/providers", asyncHandler(async (request, response) => {
      WHERE provider_profile.activation_status = 'active'
        AND ($4::text IS NULL
             OR provider_user.name ILIKE '%' || $4::text || '%'
+            OR provider_user.social_name ILIKE '%' || $4::text || '%'
             OR provider_brand.brand_name ILIKE '%' || $4::text || '%'
             OR EXISTS (SELECT 1 FROM services matching_service
                        WHERE matching_service.provider_id = provider_user.id

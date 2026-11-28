@@ -3,6 +3,8 @@ const { z } = require("zod");
 const { runQuery, runInTransaction } = require("../db");
 const { ApiError, asyncHandler } = require("../errors");
 const { paymentsAdminRouter } = require("./payments");
+const { trustAdminRouter } = require("./trust");
+const { basicDataSource } = require("../basic_data_verifier");
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PLAN_CODES = ["free", "standard", "pro", "premium"];
@@ -16,12 +18,24 @@ const listQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).max(10000).default(0),
 }).strict();
 
+// Aprovar = selo "Dados básicos verificados": o admin confere CPF e nome na
+// Serpro (por enquanto à mão; ver basic_data_verifier.js) e marca o que viu.
+const basicDataCheckSchema = z.object({
+  cpfRegular: z.literal(true, { error: "Confirme que o CPF está regular na Serpro." }),
+  nameMatches: z.literal(true, { error: "Confirme que o nome confere com o CPF." }),
+  note: z.string().trim().max(500).optional(),
+}).strict();
+
 const approvalSchema = z.object({
   status: z.enum(["active", "rejected"]),
   reason: z.string().trim().min(1).max(500).optional(),
+  basicDataCheck: basicDataCheckSchema.optional(),
 }).strict().refine(
   (change) => change.status !== "rejected" || Boolean(change.reason),
   { message: "A reason is required when rejecting a provider.", path: ["reason"] }
+).refine(
+  (change) => change.status !== "active" || Boolean(change.basicDataCheck),
+  { message: "Confira os dados básicos (CPF e nome na Serpro) antes de aprovar.", path: ["basicDataCheck"] }
 );
 
 const planUpdateSchema = z.object({
@@ -66,7 +80,15 @@ adminRouter.get("/providers", asyncHandler(async (request, response) => {
     `SELECT provider_user.id,provider_user.name,provider_user.email,provider_user.phone,
        provider_user.created_at AS "createdAt",provider_profile.bio,
        provider_profile.activation_status AS "activationStatus",
-       provider_profile.verified AS "identityVerified",
+       provider_user.social_name AS "socialName",
+       provider_profile.verified AS "basicDataVerified",
+       provider_profile.basic_data_check AS "basicDataCheck",
+       provider_profile.basic_data_verified_at AS "basicDataVerifiedAt",
+       (provider_user.cpf_encrypted IS NOT NULL) AS "hasCpf",
+       COALESCE(provider_account.kyc_status,'nao_iniciada') AS "kycStatus",
+       (provider_account.kyc_status = 'aprovada') AS "identityVerified",
+       (SELECT MAX(acceptance.version) FROM term_acceptances acceptance
+        WHERE acceptance.user_id=provider_user.id AND acceptance.term_key='prestadora_elegibilidade') AS "termVersion",
        COALESCE(provider_plan.plan_name,'free') AS "planCode",
        COALESCE(plan.display_name,'Grátis') AS "planName",
        COALESCE(plan.features,'{}'::jsonb) AS "planFeatures",
@@ -86,6 +108,7 @@ adminRouter.get("/providers", asyncHandler(async (request, response) => {
      FROM provider_profiles provider_profile
      JOIN users provider_user ON provider_user.id=provider_profile.user_id
      LEFT JOIN provider_plans provider_plan ON provider_plan.provider_id=provider_user.id
+     LEFT JOIN provider_payment_accounts provider_account ON provider_account.provider_id=provider_user.id
      LEFT JOIN plan_catalog plan ON plan.plan_code=COALESCE(provider_plan.plan_name,'free')
      LEFT JOIN provider_feature_overrides feature_override ON feature_override.provider_id=provider_user.id
      WHERE provider_user.roles @> ARRAY['prestadora']::text[]
@@ -120,10 +143,13 @@ adminRouter.patch("/providers/:id/approval", asyncHandler(async (request, respon
       `UPDATE provider_profiles
        SET activation_status=$1,
            verified=($1='active'),
+           basic_data_check=CASE WHEN $1='active' THEN $3::jsonb ELSE basic_data_check END,
+           basic_data_verified_at=CASE WHEN $1='active' THEN now() ELSE NULL END,
            available=CASE WHEN $1='rejected' THEN false ELSE available END
        WHERE user_id=$2
-       RETURNING user_id AS id,activation_status AS "activationStatus",verified AS "identityVerified"`,
-      [change.status, request.params.id]
+       RETURNING user_id AS id,activation_status AS "activationStatus",verified AS "basicDataVerified"`,
+      [change.status, request.params.id,
+       change.basicDataCheck ? JSON.stringify({ ...change.basicDataCheck, source: basicDataSource(), checkedBy: request.user.id }) : null]
     );
     // Pedidos de verificação ainda abertos são resolvidos junto com o cadastro
     await transaction.query(
@@ -148,6 +174,7 @@ adminRouter.patch("/providers/:id/approval", asyncHandler(async (request, respon
       previousStatus,
       status: change.status,
       reason: change.reason ?? null,
+      basicDataCheck: change.basicDataCheck ?? null,
     });
     return updatedProviders[0];
   });
@@ -601,5 +628,6 @@ adminRouter.get("/audit-events", asyncHandler(async (request, response) => {
 
 // Seção Pagamentos (configuração, impacto, auditoria)
 adminRouter.use(paymentsAdminRouter);
+adminRouter.use(trustAdminRouter);
 
 module.exports = adminRouter;

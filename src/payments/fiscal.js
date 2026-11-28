@@ -97,7 +97,18 @@ async function loadCustomerFiscalData(client, customerId) {
   return row;
 }
 
+// CPF ou CNPJ (inclusive alfanumérico) com máscara
+function formatDocument(document) {
+  if (!document) return null;
+  const digits = onlyDigits(document);
+  if (digits.length === 11) return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}-${digits.slice(9)}`;
+  const value = String(document).toUpperCase();
+  if (value.length === 14) return `${value.slice(0, 2)}.${value.slice(2, 5)}.${value.slice(5, 8)}/${value.slice(8, 12)}-${value.slice(12)}`;
+  return document;
+}
+
 module.exports = {
+  formatDocument,
   REGIMES,
   FIELD_LABELS,
   onlyDigits,

@@ -54,6 +54,9 @@ async function processEvent(client, event, eventRowId, gatewayName) {
     case "RECIPIENT_APPROVED":
     case "RECIPIENT_REJECTED":
       return processRecipient(client, event, gatewayName);
+    case "RECIPIENT_KYC_APPROVED":
+    case "RECIPIENT_KYC_REJECTED":
+      return processKyc(client, event, gatewayName);
     case "PAYMENT_CONFIRMED":
     case "PAYMENT_FAILED":
       return processPayment(client, event, eventRowId, gatewayName);
@@ -78,6 +81,30 @@ async function processRecipient(client, event, gatewayName) {
     type: approved ? "payment_account_approved" : "payment_account_rejected",
     title: approved ? "Conta de recebimento aprovada" : "Conta de recebimento recusada",
     body: approved ? "Você já pode criar planos e receber pelo app." : `Confira os dados bancários. ${event.motivo ?? ""}`.trim(),
+    data: {}, area: "provider",
+  });
+}
+
+// Prova de vida do recebedor: é o selo "Identidade verificada" e libera
+// planos e repasses. Recusa permite tentar de novo com um link novo.
+async function processKyc(client, event, gatewayName) {
+  const approved = event.tipo === "RECIPIENT_KYC_APPROVED";
+  const { rows } = await client.query(
+    `UPDATE provider_payment_accounts
+     SET kyc_status=$3, kyc_reason=$4, kyc_verified_at=CASE WHEN $3='aprovada' THEN now() ELSE NULL END,
+         kyc_link_url=NULL, kyc_link_expires_at=NULL, updated_at=now()
+     WHERE gateway=$1 AND gateway_recipient_id=$2 AND kyc_status <> 'aprovada'
+     RETURNING provider_id`,
+    [gatewayName, event.recipientId, approved ? "aprovada" : "recusada", approved ? null : event.motivo ?? "Não aprovada pela instituição de pagamento"]
+  );
+  if (!rows[0]) return;
+  await notify(client, {
+    userId: rows[0].provider_id,
+    type: approved ? "identity_verified" : "identity_rejected",
+    title: approved ? "Identidade verificada" : "Prova de vida não aprovada",
+    body: approved
+      ? "Seu perfil ganhou o selo de identidade verificada e seus repasses estão liberados."
+      : `Faça a prova de vida de novo em Planos e recebimentos. ${event.motivo ?? ""}`.trim(),
     data: {}, area: "provider",
   });
 }

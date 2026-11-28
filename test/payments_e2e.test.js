@@ -122,18 +122,53 @@ describe("pagamentos ponta a ponta (PostgreSQL real)", { skip: !DATABASE_URL && 
   });
 
   test("prestadora cadastra a conta e o recebedor é aprovado por webhook", async () => {
+    const cpf = randomCpf();
     const response = await call("PUT", "/api/v1/me/payments/account", {
       as: ids.provider,
       body: {
-        holderName: "Prestadora E2E", holderDocument: randomCpf(), bankCode: "260", branch: "0001",
+        // conta antiga sem CPF no cadastro: o informado vira o CPF do cadastro
+        holderName: "Outro Nome", holderDocument: cpf, bankCode: "260", branch: "0001",
         account: "12345-6", accountType: "corrente", cityCode: "3128709",
       },
     });
     assert.equal(response.status, 200, JSON.stringify(response.body));
+    // titular é sempre ela (PF): nome do cadastro, não o digitado
+    assert.equal(response.body.holderName, "Prestadora E2E");
     await waitFor(async () => (await one("SELECT status FROM provider_payment_accounts WHERE provider_id=$1", [ids.provider.id]))?.status === "aprovada", "recebedor aprovado");
     const overview = await call("GET", "/api/v1/me/payments/overview", { as: ids.provider });
-    assert.equal(overview.body.eligibility.eligible, true, JSON.stringify(overview.body.eligibility));
+    assert.equal(overview.body.holder.type, "cpf");
+    assert.equal(overview.body.holder.document.replace(/\D/g, ""), cpf);
+    // sem prova de vida: ainda não pode criar planos
+    assert.equal(overview.body.eligibility.eligible, false);
+    assert.deepEqual(overview.body.eligibility.missing.map((item) => item.key), ["identity"]);
     assert.deepEqual(overview.body.seats, { used: 0, limit: 1, full: false });
+  });
+
+  test("prova de vida no gateway: link, resultado por webhook e selo de identidade", async () => {
+    const early = await call("POST", "/api/v1/dev/payments/me/kyc", { as: ids.provider, body: { outcome: "approve" } });
+    assert.equal(early.status, 409, "sem abrir o link não há resultado");
+    const link = await call("POST", "/api/v1/me/payments/account/kyc-link", { as: ids.provider });
+    assert.equal(link.status, 200, JSON.stringify(link.body));
+    assert.equal(link.body.kyc.status, "pendente");
+    assert.match(link.body.kyc.linkUrl, /^https:\/\//);
+    const again = await call("POST", "/api/v1/me/payments/account/kyc-link", { as: ids.provider });
+    assert.equal(again.body.kyc.linkUrl, link.body.kyc.linkUrl, "link válido é reaproveitado");
+
+    const refused = await call("POST", "/api/v1/dev/payments/me/kyc", { as: ids.provider, body: { outcome: "fail" } });
+    assert.equal(refused.status, 200, JSON.stringify(refused.body));
+    await waitFor(async () => (await one("SELECT kyc_status FROM provider_payment_accounts WHERE provider_id=$1", [ids.provider.id]))?.kyc_status === "recusada", "prova de vida recusada");
+
+    // tenta de novo com um link novo
+    const retry = await call("POST", "/api/v1/me/payments/account/kyc-link", { as: ids.provider });
+    assert.equal(retry.body.kyc.status, "pendente");
+    await call("POST", "/api/v1/dev/payments/me/kyc", { as: ids.provider, body: { outcome: "approve" } });
+    await waitFor(async () => (await one("SELECT kyc_status FROM provider_payment_accounts WHERE provider_id=$1", [ids.provider.id]))?.kyc_status === "aprovada", "prova de vida aprovada");
+
+    const overview = await call("GET", "/api/v1/me/payments/overview", { as: ids.provider });
+    assert.equal(overview.body.eligibility.eligible, true, JSON.stringify(overview.body.eligibility));
+    assert.equal(overview.body.account.kyc.status, "aprovada");
+    const notifications = await db.runQuery("SELECT type FROM notifications WHERE user_id=$1 AND type LIKE 'identity_%' ORDER BY created_at", [ids.provider.id]);
+    assert.deepEqual(notifications.rows.map((row) => row.type), ["identity_rejected", "identity_verified"]);
   });
 
   test("cotação ao vivo: 3000 → cliente paga 3219, prestadora recebe 3000", async () => {
@@ -302,6 +337,55 @@ describe("pagamentos ponta a ponta (PostgreSQL real)", { skip: !DATABASE_URL && 
     assert.equal((await one("SELECT status FROM payables WHERE charge_id=$1", [charges[0].id])).status, "revertido");
   });
 
+  test("cartão salvo: salva no gateway, paga o avulso e sai da lista", async () => {
+    const invalid = await call("POST", "/api/v1/me/payments/cards", {
+      as: ids.customer2,
+      body: { token: "tok_mock_invalido", last4: "1111", brand: "visa", expMonth: 12, expYear: 2099, holderName: "Cliente Dois" },
+    });
+    assert.equal(invalid.status, 422);
+    const added = await call("POST", "/api/v1/me/payments/cards", {
+      as: ids.customer2,
+      body: { token: "tok_mock_aprovar", last4: "4242", brand: "visa", expMonth: 12, expYear: 2099, holderName: "Cliente Dois" },
+    });
+    assert.equal(added.status, 201, JSON.stringify(added.body));
+    assert.equal(added.body.isDefault, true, "o primeiro cartão vira o principal");
+    assert.ok(!("token" in added.body) && !("gatewayCardId" in added.body));
+    const expired = await call("POST", "/api/v1/me/payments/cards", {
+      as: ids.customer2,
+      body: { token: "tok_mock_aprovar", last4: "4242", expMonth: 1, expYear: 2020, holderName: "Cliente Dois" },
+    });
+    assert.equal(expired.status, 422);
+
+    const order = await call("POST", "/api/v1/orders", {
+      as: ids.customer2, headers: { "Idempotency-Key": "e2e-order-saved-card" },
+      body: {
+        serviceId: ids.serviceId, scheduledAt: new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString(),
+        paymentMethod: { type: "card", savedCardId: added.body.id },
+      },
+    });
+    assert.equal(order.status, 201, JSON.stringify(order.body));
+    const charge = await one("SELECT id, saved_card_id, pending_card_token_encrypted FROM charges WHERE order_id=$1", [order.body.id]);
+    assert.equal(charge.saved_card_id, added.body.id);
+    assert.equal(charge.pending_card_token_encrypted, null);
+    await waitFor(async () => (await one("SELECT status FROM charges WHERE id=$1", [charge.id]))?.status === "paga", "avulso no cartão salvo pago");
+
+    // cartão de outra cliente não serve
+    const foreign = await call("POST", "/api/v1/orders", {
+      as: ids.customer, headers: { "Idempotency-Key": "e2e-order-foreign-card" },
+      body: {
+        serviceId: ids.serviceId, scheduledAt: new Date(Date.now() + 6 * 24 * 3600 * 1000).toISOString(),
+        paymentMethod: { type: "card", savedCardId: added.body.id },
+      },
+    });
+    assert.equal(foreign.status, 404);
+
+    const listed = await call("GET", "/api/v1/me/payments/cards", { as: ids.customer2 });
+    assert.equal(listed.body.length, 1);
+    const removed = await call("DELETE", `/api/v1/me/payments/cards/${added.body.id}`, { as: ids.customer2 });
+    assert.equal(removed.status, 204);
+    assert.equal((await call("GET", "/api/v1/me/payments/cards", { as: ids.customer2 })).body.length, 0);
+  });
+
   test("webhook com assinatura inválida é recusado; evento repetido é ignorado", async () => {
     const forged = await fetch(`${baseUrl}/webhooks/payments`, {
       method: "POST", headers: { "content-type": "application/json", "x-mock-signature": "00" },
@@ -343,16 +427,88 @@ describe("pagamentos ponta a ponta (PostgreSQL real)", { skip: !DATABASE_URL && 
     assert.equal(profile.body.nbsCode, "126021000");
     assert.equal(profile.body.cClassTrib, "000001");
     assert.deepEqual(profile.body.nbsOptions.map((option) => option.code), ["126021000", "126022000"]);
+    // pessoa física: o CPF vem do cadastro e não se troca por aqui
+    assert.equal(profile.body.cpfFromRegistration, true);
+    assert.ok(profile.body.cpf);
+    const otherCpf = await call("PUT", "/api/v1/me/payments/fiscal-profile", {
+      as: ids.provider, body: { regime: "informal", cpf: randomCpf(), serviceCode: "6.01" },
+    });
+    assert.equal(otherCpf.status, 422);
+    assert.ok(otherCpf.body.error.details.cpf);
     const wrong = await call("PUT", "/api/v1/me/payments/fiscal-profile", {
-      as: ids.provider, body: { regime: "informal", cpf: randomCpf(), serviceCode: "6.01", nbsCode: "1.1803.10.00", cClassTrib: "000001" },
+      as: ids.provider, body: { regime: "informal", serviceCode: "6.01", nbsCode: "1.1803.10.00", cClassTrib: "000001" },
     });
     assert.equal(wrong.status, 422);
     assert.ok(wrong.body.error.details.nbsCode);
     const saved = await call("PUT", "/api/v1/me/payments/fiscal-profile", {
-      as: ids.provider, body: { regime: "informal", cpf: randomCpf(), serviceCode: "6.01", nbsCode: "1.2602.20.00", cClassTrib: "000001" },
+      as: ids.provider, body: { regime: "informal", serviceCode: "6.01", nbsCode: "1.2602.20.00", cClassTrib: "000001" },
     });
     assert.equal(saved.status, 200, JSON.stringify(saved.body));
     assert.equal(saved.body.nbsCode, "126022000");
+  });
+
+  test("cadastro de prestadora: termo obrigatório, nome social no perfil e edição da conta", async () => {
+    const term = await call("GET", "/api/v1/terms/prestadora_elegibilidade");
+    assert.equal(term.status, 200);
+    assert.match(term.body.body, /Mulheres trans são mulheres/);
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const base = {
+      name: "Registro Civil", email: `reg-${suffix}@e2e.test`, phone: `+55359${String(parseInt(suffix, 16)).padStart(8, "0").slice(0, 8)}`,
+      password: "Teste@1234", role: "prestadora", cpf: randomCpf(),
+    };
+    const noTerm = await call("POST", "/api/v1/auth/registrations", { body: base });
+    assert.equal(noTerm.status, 422);
+    assert.ok(noTerm.body.error.details.acceptedTerms);
+    const outdated = await call("POST", "/api/v1/auth/registrations", {
+      body: { ...base, acceptedTerms: { key: "prestadora_elegibilidade", version: term.body.version + 1 } },
+    });
+    assert.equal(outdated.status, 409);
+    const created = await call("POST", "/api/v1/auth/registrations", {
+      body: { ...base, socialName: "Nome Social", acceptedTerms: { key: "prestadora_elegibilidade", version: term.body.version } },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const userId = created.body.user.id;
+    const acceptance = await one("SELECT version FROM term_acceptances WHERE user_id=$1", [userId]);
+    assert.equal(acceptance.version, term.body.version);
+    const user = { id: userId, roles: ["prestadora"] };
+
+    // dados básicos: abertos antes da verificação
+    const account = await call("GET", "/api/v1/me/account", { as: user });
+    assert.equal(account.status, 200, JSON.stringify(account.body));
+    assert.equal(account.body.socialName, "Nome Social");
+    assert.equal(account.body.providerTermVersion, term.body.version);
+    assert.match(account.body.cpfMasked, /^\*\*\*\.\d{3}\.\d{3}-\*\*$/);
+    const renamed = await call("PATCH", "/api/v1/me/account", { as: user, body: { name: "Registro Novo", socialName: "" } });
+    assert.equal(renamed.status, 200);
+    assert.equal(renamed.body.name, "Registro Novo");
+    assert.equal(renamed.body.socialName, null);
+    const noPassword = await call("PATCH", "/api/v1/me/account", { as: user, body: { email: `novo-${suffix}@e2e.test` } });
+    assert.equal(noPassword.status, 403);
+    const taken = await call("PATCH", "/api/v1/me/account", {
+      as: user, body: { email: (await one("SELECT email FROM users WHERE id=$1", [ids.customer.id])).email, currentPassword: "Teste@1234" },
+    });
+    assert.equal(taken.status, 409);
+    const changed = await call("PATCH", "/api/v1/me/account", {
+      as: user, body: { email: `novo-${suffix}@e2e.test`, currentPassword: "Teste@1234" },
+    });
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.equal(changed.body.email, `novo-${suffix}@e2e.test`);
+  });
+
+  test("repasse espera a prova de vida", async () => {
+    const payable = await one(
+      `SELECT p.id FROM payables p WHERE p.provider_id=$1 AND p.status='previsto' LIMIT 1`, [ids.provider.id]
+    );
+    if (!payable) return; // nada previsto neste ponto do roteiro
+    await db.runQuery("UPDATE payables SET expected_payout_date=CURRENT_DATE - 1 WHERE id=$1", [payable.id]);
+    await db.runQuery("UPDATE provider_payment_accounts SET kyc_status='recusada' WHERE provider_id=$1", [ids.provider.id]);
+    await call("POST", "/api/v1/dev/payments/run-maintenance", { as: ids.provider });
+    assert.equal((await one("SELECT status FROM payables WHERE id=$1", [payable.id])).status, "previsto");
+    const statement = await call("GET", "/api/v1/me/payments/statement", { as: ids.provider });
+    assert.equal(statement.body.payoutsOnHold, true);
+    await db.runQuery("UPDATE provider_payment_accounts SET kyc_status='aprovada' WHERE provider_id=$1", [ids.provider.id]);
+    await call("POST", "/api/v1/dev/payments/run-maintenance", { as: ids.provider });
+    assert.equal((await one("SELECT status FROM payables WHERE id=$1", [payable.id])).status, "pago");
   });
 
   test("extrato e dados da nota são lidos do que foi gravado", async () => {

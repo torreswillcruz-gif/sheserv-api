@@ -39,6 +39,7 @@
         <button type="button" class="section-link" data-section="categories">Categorias</button>
         <button type="button" class="section-link" data-section="services">Serviços</button>
         <button type="button" class="section-link" data-section="payments">Pagamentos</button>
+        <button type="button" class="section-link" data-section="terms">Termos</button>
       </nav>
       <div class="topbar-user">
         <span id="admin-name" class="muted"></span>
@@ -141,6 +142,37 @@
       <div class="list-footer"><button type="button" class="button ghost load-more" hidden>Carregar mais</button></div>
     </main>
 
+    <!-- Termos -->
+    <main class="content" data-section-panel="terms" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Termos</h1>
+          <p class="muted">Texto mostrado no cadastro da prestadora. Publicar cria uma versão nova: os próximos cadastros aceitam a versão nova; quem aceitou antes continua com o aceite registrado da versão dela.</p>
+        </div>
+        <button type="button" class="button ghost refresh-button">Atualizar</button>
+      </div>
+      <p class="list-status muted" role="status"></p>
+      <section class="card terms-card" hidden>
+        <form class="terms-form">
+          <label>
+            Título
+            <input type="text" class="terms-title" maxlength="200" required>
+          </label>
+          <label>
+            Texto
+            <textarea class="terms-body" rows="22" maxlength="20000" required></textarea>
+          </label>
+          <p class="terms-warning badge warning" hidden>O texto ainda tem "X dias úteis": defina o prazo de resposta antes de publicar.</p>
+          <div class="card-actions">
+            <button type="submit" class="button primary terms-publish">Publicar nova versão</button>
+            <span class="muted terms-current"></span>
+          </div>
+        </form>
+        <h3>Versões</h3>
+        <ul class="terms-versions"></ul>
+      </section>
+    </main>
+
     <!-- Pagamentos -->
     <main class="content" data-section-panel="payments" hidden>
       <div class="page-head">
@@ -235,7 +267,10 @@
       <dl class="card-contact">
         <div><dt>E-mail</dt><dd class="card-email"></dd></div>
         <div><dt>Telefone</dt><dd class="card-phone"></dd></div>
-        <div><dt>Verificada</dt><dd class="card-identity"></dd></div>
+        <div><dt>Nome social</dt><dd class="card-social-name"></dd></div>
+        <div><dt>Dados básicos</dt><dd class="card-basic-data"></dd></div>
+        <div><dt>Identidade (prova de vida)</dt><dd class="card-identity"></dd></div>
+        <div><dt>Termo de prestadora</dt><dd class="card-term"></dd></div>
       </dl>
       <div class="card-section">
         <h3>Sobre o trabalho</h3>
@@ -264,6 +299,20 @@
           <button type="button" class="button ghost feature-reset">Seguir só o plano</button>
         </div>
       </details>
+      <fieldset class="card-section basic-data-check">
+        <legend>Conferência dos dados básicos (Serpro)</legend>
+        <p class="muted">Consulte o CPF na Serpro e confira com o cadastro. Aprovar dá o selo "Dados básicos verificados" e libera o app.</p>
+        <div class="card-actions">
+          <button type="button" class="button ghost basic-data-reveal">Mostrar CPF</button>
+          <span class="basic-data-cpf" aria-live="polite"></span>
+        </div>
+        <label class="checkbox-line"><input type="checkbox" class="check-cpf-regular"> CPF em situação regular na Serpro</label>
+        <label class="checkbox-line"><input type="checkbox" class="check-name-matches"> Nome do cadastro confere com o do CPF</label>
+        <label>
+          Observação (opcional)
+          <input type="text" class="check-note" maxlength="500">
+        </label>
+      </fieldset>
       <div class="card-actions">
         <button type="button" class="button primary action-approve">Aprovar</button>
         <button type="button" class="button danger-outline action-reject">Recusar</button>

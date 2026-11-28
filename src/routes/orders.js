@@ -133,11 +133,20 @@ const createOrderSchema = z.object({
   scheduledAt: z.string().datetime({ offset: true }),
   paymentMethod: z.discriminatedUnion("type", [
     z.object({ type: z.literal("pix") }),
-    z.object({ type: z.literal("card"), paymentMethodToken: z.string().min(8) }),
+    // token de uso único do PSP ou cartão salvo da cliente (savedCardId)
+    z.object({
+      type: z.literal("card"),
+      paymentMethodToken: z.string().min(8).optional(),
+      savedCardId: z.string().uuid().optional(),
+    }),
   ]).optional(),
   subscriptionId: z.string().uuid().optional(),
 }).strict().refine((body) => Boolean(body.paymentMethod) !== Boolean(body.subscriptionId), {
   message: "Envie paymentMethod ou subscriptionId (um dos dois).",
+  path: ["paymentMethod"],
+}).refine((body) => body.paymentMethod?.type !== "card"
+  || Boolean(body.paymentMethod.paymentMethodToken) !== Boolean(body.paymentMethod.savedCardId), {
+  message: "Envie o token do cartão ou o cartão salvo (um dos dois).",
   path: ["paymentMethod"],
 });
 

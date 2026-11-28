@@ -36,6 +36,9 @@ pontos não foram testados contra a API real.
 | `createRecipient` | `POST /core/v5/recipients` | Conta bancária padrão + `transfer_settings`. Pessoa física pede dados de KYC (nascimento, renda, ocupação, endereço) que o mock não exige: acrescentar ao formulário |
 | `getRecipientStatus` | `GET /core/v5/recipients/{id}` | |
 | `updateRecipientPayoutSchedule` | `PATCH /core/v5/recipients/{id}/transfer-settings` | Até onde sei, aceita `Daily`, `Weekly` e `Monthly`. O app usa semanal (padrão) e mensal |
+| `createKycLink` | `POST /core/v5/recipients/{id}/kyc_link` | Link da prova de vida (selfie + documento) que a prestadora abre no celular. O resultado vira `RECIPIENT_KYC_APPROVED`/`RECIPIENT_KYC_REJECTED` no `parseWebhook` (confirmar o nome do evento de KYC na documentação) |
+| `saveCard` | `POST /core/v5/customers` (uma vez) e `POST /core/v5/customers/{id}/cards` com `token` | O app tokeniza com a chave pública (`POST /core/v5/tokens?appId=`), num `CardTokenizer` novo no lugar do `DemoCardTokenizer`. Cobrança e assinatura com cartão salvo usam `card_id` (`metodoPagamento.cartaoId`) |
+| `deleteCard` | `DELETE /core/v5/customers/{id}/cards/{card_id}` | |
 | `createCharge` | `POST /core/v5/orders` | Split com `type: "flat"` (centavos absolutos) por recebedor; a taxa do gateway fica com a plataforma (`charge_processing_fee`) |
 | `createSubscription` | `POST /core/v5/subscriptions` | Confirmar se a assinatura aceita split. Se não aceitar, o ciclo pode ser cobrado por `createCharge` com o cartão salvo, e o domínio não muda |
 | `updateSubscriptionAmount` | atualização de itens/valor da assinatura | Usado na repactuação e quando o desconto de repasse muda o split do ciclo |

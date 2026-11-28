@@ -19,6 +19,7 @@ const { businessRouter } = require("./routes/business");
 const { notificationsRouter } = require("./routes/notifications");
 const { paymentsRouter } = require("./routes/payments");
 const { devPaymentsRouter } = require("./routes/payments_dev");
+const { publicAccountRouter, accountRouter } = require("./routes/account");
 const { receiveWebhook } = require("./payments/webhooks");
 const { asyncHandler } = require("./errors");
 
@@ -53,11 +54,13 @@ apiV1Router.use(
   authRoutes
 );
 apiV1Router.use(catalogRoutes);
+apiV1Router.use(publicAccountRouter);
 
 // Daqui para baixo tudo exige o Bearer token
 apiV1Router.use(requireAuthentication);
 // Conta sem identidade verificada só usa o que leva à verificação (ver identity.js)
 apiV1Router.use(requireVerifiedIdentity);
+apiV1Router.use(accountRouter);
 apiV1Router.use(ordersRouter);
 apiV1Router.use(addressRoutes);
 apiV1Router.use("/provider", requireRole("prestadora"), providerRoutes);

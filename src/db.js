@@ -41,6 +41,9 @@ async function runMigrations() {
   // Módulo de pagamentos (depende das tabelas acima)
   const paymentsSql = fs.readFileSync(path.join(__dirname, "payments_schema.sql"), "utf8");
   await connectionPool.query(paymentsSql);
+  // Termos, selos de verificação e cartões salvos (dependem dos dois acima)
+  const trustSql = fs.readFileSync(path.join(__dirname, "trust_schema.sql"), "utf8");
+  await connectionPool.query(trustSql);
 }
 
 module.exports = { connectionPool, runQuery, runInTransaction, runMigrations };

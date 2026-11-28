@@ -45,3 +45,10 @@ services:
       # Só para o painel mostrar o gateway ativo (o mesmo da marketplace-api)
       - key: PAYMENT_GATEWAY
         value: mock
+      # A MESMA chave da marketplace-api: o admin abre o CPF da prestadora
+      # para conferir na Serpro (cada consulta fica na auditoria)
+      - key: DATA_ENCRYPTION_KEY
+        sync: false
+      # manual (padrão) ou serpro_datavalid (quando houver contrato)
+      - key: BASIC_DATA_VERIFIER
+        value: manual
